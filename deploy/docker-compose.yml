@@ -1,0 +1,30 @@
+# tunler server: pull the published image and run it.
+#
+# Requires a .env file next to this one with at least:
+#   TUNLER_DOMAIN=tunler.example.com
+#   TUNLER_EMAIL=you@example.com
+#   TUNLER_PASSWORD=<master password>
+#
+# The image binds ports 80/443 and obtains Let's Encrypt certificates on
+# demand. If another reverse proxy already owns 80/443, drop the `ports`
+# block and pass raw TLS through by SNI instead; see the advanced note in
+# the README (tunler generates a Traefik dynamic-config file when given
+# --traefik-file).
+services:
+  tunler:
+    image: ghcr.io/jessegall/tunler:latest
+    container_name: tunler
+    restart: unless-stopped
+    command:
+      - "--domain=${TUNLER_DOMAIN:?set TUNLER_DOMAIN in .env}"
+      - "--email=${TUNLER_EMAIL:-}"
+    environment:
+      - TUNLER_PASSWORD=${TUNLER_PASSWORD:?set TUNLER_PASSWORD in .env}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - data:/var/lib/tunler # registrations + cached certificates
+
+volumes:
+  data:
