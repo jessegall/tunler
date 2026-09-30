@@ -126,6 +126,7 @@ type opts struct {
 	all            bool
 	jsonOut        bool
 	follow         bool
+	check          bool
 }
 
 // parse resolves flags and positionals for a subcommand. Flags and positional
@@ -154,6 +155,7 @@ func parse(name string, args []string) (opts, []string, error) {
 	fs.BoolVar(&o.jsonOut, "json", false, "machine-readable JSON output")
 	fs.BoolVar(&o.follow, "follow", false, "keep following log output (logs)")
 	fs.BoolVar(&o.follow, "f", false, "shorthand for --follow")
+	fs.BoolVar(&o.check, "check", false, "only report whether an update is available (update)")
 
 	var positional []string
 	for rest := args; len(rest) > 0; {
@@ -704,7 +706,8 @@ USAGE
   tunler domains                                          list domains you own
   tunler release <domain>|--all                           unclaim domain(s)
   tunler logout                                           forget saved login (and revoke it)
-  tunler update                                           self-update from the server
+  tunler update [--check] [--json]                        self-update from the server
+                                                          (--check: only report)
   tunler version                                          print version
 
 EXAMPLES

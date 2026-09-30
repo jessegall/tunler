@@ -196,3 +196,14 @@ func TestTunnelAcquire(t *testing.T) {
 		}
 	})
 }
+
+func TestVersionEndpoint(t *testing.T) {
+	srv := testServer(t)
+	req := httptest.NewRequest(http.MethodGet, "http://tunler.example.com"+protocol.VersionPath, nil)
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+	var v protocol.VersionResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &v); err != nil || w.Code != http.StatusOK || v.Version != Version {
+		t.Fatalf("version: code %d, body %s", w.Code, w.Body)
+	}
+}

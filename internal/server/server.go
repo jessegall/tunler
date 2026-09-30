@@ -181,6 +181,8 @@ func (s *Server) serveControlPlane(w http.ResponseWriter, r *http.Request) {
 		s.handleDomains(w, r)
 	case protocol.ReleasePath:
 		s.handleRelease(w, r)
+	case protocol.VersionPath:
+		writeJSON(w, protocol.VersionResponse{Version: Version})
 	case protocol.ControlPath:
 		s.handleControl(w, r)
 	case protocol.DataPath:

@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/jessegall/tunler/internal/client"
+	"github.com/jessegall/tunler/internal/protocol"
 )
 
 // cmdUpdate replaces the running binary with the one distributed by the tunler
@@ -84,6 +86,9 @@ func cmdUpdate(args []string) error {
 	if err != nil {
 		return fmt.Errorf("cannot hash %s: %w", self, err)
 	}
+	if o.check {
+		return reportUpdate(o, get, current != published)
+	}
 	if current == published {
 		fmt.Printf("tunler %s is already up to date\n", version)
 		return nil
@@ -124,6 +129,36 @@ func cmdUpdate(args []string) error {
 		fmt.Printf("updated: tunler %s -> %s", version, out)
 	} else {
 		fmt.Println("updated")
+	}
+	return nil
+}
+
+// reportUpdate prints whether an update is available without installing it.
+// Whether one is available is decided by checksum, as for the update itself;
+// the server's version names it (servers before /_tunler/version leave it
+// empty).
+func reportUpdate(o opts, get getter, available bool) error {
+	latest := ""
+	if raw, err := fetchString(get, "https://"+o.host+protocol.VersionPath); err == nil {
+		var v protocol.VersionResponse
+		if json.Unmarshal([]byte(raw), &v) == nil {
+			latest = v.Version
+		}
+	}
+	if o.jsonOut {
+		return json.NewEncoder(os.Stdout).Encode(struct {
+			Current         string `json:"current"`
+			Latest          string `json:"latest,omitempty"`
+			UpdateAvailable bool   `json:"update_available"`
+		}{version, latest, available})
+	}
+	switch {
+	case !available:
+		fmt.Printf("tunler %s is up to date\n", version)
+	case latest != "":
+		fmt.Printf("tunler %s is available (you have %s): run tunler update\n", latest, version)
+	default:
+		fmt.Printf("a newer tunler is available (you have %s): run tunler update\n", version)
 	}
 	return nil
 }

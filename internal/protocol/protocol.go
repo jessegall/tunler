@@ -28,6 +28,10 @@ const (
 	// ReleasePath (POST) unclaims a domain owned by the authenticated user.
 	ReleasePath = "/_tunler/release"
 
+	// VersionPath (GET) reports the server's version, which is also the
+	// version of the client binaries it serves.
+	VersionPath = "/_tunler/version"
+
 	HeaderDomain = "X-Tunler-Domain"
 	HeaderSecret = "X-Tunler-Secret"
 	HeaderConnID = "X-Tunler-Conn"
@@ -81,6 +85,11 @@ type DomainsResponse struct {
 // ReleaseRequest unclaims a domain owned by the authenticated user.
 type ReleaseRequest struct {
 	Domain string `json:"domain"`
+}
+
+// VersionResponse is the answer of VersionPath.
+type VersionResponse struct {
+	Version string `json:"version"`
 }
 
 // ErrorResponse is the JSON body of any non-2xx /_tunler response. Code, when
