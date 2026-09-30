@@ -19,8 +19,10 @@ func testServer(t *testing.T) *Server {
 	return New(cfg, newTestState(t))
 }
 
-func postLogin(srv *Server, email, password string) *httptest.ResponseRecorder {
-	body, _ := json.Marshal(protocol.LoginRequest{Email: email, Password: password})
+// postLogin creates (or logs in to) account user with the account password
+// "account-pw", passing master as the server master password.
+func postLogin(srv *Server, user, master string) *httptest.ResponseRecorder {
+	body, _ := json.Marshal(protocol.LoginRequest{Username: user, Password: "account-pw", MasterPassword: master})
 	req := httptest.NewRequest(http.MethodPost, "http://tunler.example.com"+protocol.LoginPath, bytes.NewReader(body))
 	w := httptest.NewRecorder()
 	srv.ServeHTTP(w, req)
@@ -46,8 +48,8 @@ func TestLogin(t *testing.T) {
 		t.Fatal("minted secret does not authorize")
 	}
 
-	if w := postLogin(srv, "not-an-email", "correct-password"); w.Code != http.StatusBadRequest {
-		t.Fatalf("invalid email: code = %d, want 400", w.Code)
+	if w := postLogin(srv, "Not Valid!", "correct-password"); w.Code != http.StatusBadRequest {
+		t.Fatalf("invalid username: code = %d, want 400", w.Code)
 	}
 }
 

@@ -101,14 +101,14 @@ func TestVerifyLegacyPasswordHash(t *testing.T) {
 
 func TestRegistrationAllowsEmail(t *testing.T) {
 	open := Registration{Mode: "open"}
-	if !open.allowsEmail("anyone@x.nl") {
+	if !open.allowsUser("anyone@x.nl") {
 		t.Error("open mode should allow any email")
 	}
 	list := Registration{Mode: "allowlist", Allowlist: []string{"ok@x.nl"}}
-	if !list.allowsEmail("ok@x.nl") {
+	if !list.allowsUser("ok@x.nl") {
 		t.Error("allowlisted email rejected")
 	}
-	if list.allowsEmail("nope@x.nl") {
+	if list.allowsUser("nope@x.nl") {
 		t.Error("non-allowlisted email accepted")
 	}
 }

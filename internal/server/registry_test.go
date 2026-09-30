@@ -32,17 +32,17 @@ func TestValidDomain(t *testing.T) {
 	}
 }
 
-func TestValidEmail(t *testing.T) {
-	valid := []string{"me@example.com", "a.b+c@sub.domain.nl"}
-	invalid := []string{"", "no-at.com", "@x.com", "a@b", "a b@c.com", "a@bc"}
-	for _, e := range valid {
-		if !ValidEmail(e) {
-			t.Errorf("ValidEmail(%q) = false, want true", e)
+func TestValidUsername(t *testing.T) {
+	valid := []string{"jesse", "a", "dev-2", "me@example.com", "a.b+c@sub.domain.nl"}
+	invalid := []string{"", "-lead", "trail.", "Upper", "a b", "a/b", "a:b"}
+	for _, u := range valid {
+		if !ValidUsername(u) {
+			t.Errorf("ValidUsername(%q) = false, want true", u)
 		}
 	}
-	for _, e := range invalid {
-		if ValidEmail(e) {
-			t.Errorf("ValidEmail(%q) = true, want false", e)
+	for _, u := range invalid {
+		if ValidUsername(u) {
+			t.Errorf("ValidUsername(%q) = true, want false", u)
 		}
 	}
 }

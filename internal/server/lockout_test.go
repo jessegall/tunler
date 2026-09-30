@@ -12,14 +12,15 @@ func TestLockoutBackoffNeverOverflows(t *testing.T) {
 	srv := testServer(t)
 	srv.loginMu.Lock()
 	defer srv.loginMu.Unlock()
+	l := &lockState{}
 	// Walk far past the point where time.Minute<<over used to wrap negative.
 	for i := 0; i < 100; i++ {
-		srv.recordLoginFailure("test")
-		if srv.loginFails < srv.cfg.Lockout.Threshold {
+		srv.recordLoginFailure(l, "", "test")
+		if l.fails < srv.cfg.Lockout.Threshold {
 			continue
 		}
-		if wait := time.Until(srv.loginLock); wait <= 0 || wait > time.Duration(srv.cfg.Lockout.MaxBackoff) {
-			t.Fatalf("after %d failures the lock runs %s", srv.loginFails, wait)
+		if wait := time.Until(l.until); wait <= 0 || wait > time.Duration(srv.cfg.Lockout.MaxBackoff) {
+			t.Fatalf("after %d failures the lock runs %s", l.fails, wait)
 		}
 	}
 }

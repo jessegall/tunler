@@ -17,7 +17,8 @@ type Store struct {
 
 // HostCreds is a saved login for one tunler server.
 type HostCreds struct {
-	Email  string `json:"email"`
+	User   string `json:"user"`
+	Email  string `json:"email,omitempty"` // old name of User, read on load
 	Secret string `json:"secret"`
 
 	// Ephemeral remembers the random domains used for tunnels started
@@ -72,6 +73,12 @@ func LoadStore() Store {
 	json.Unmarshal(raw, &s)
 	if s.Hosts == nil {
 		s.Hosts = map[string]HostCreds{}
+	}
+	for host, c := range s.Hosts {
+		if c.User == "" && c.Email != "" {
+			c.User, c.Email = c.Email, ""
+			s.Hosts[host] = c
+		}
 	}
 	return s
 }

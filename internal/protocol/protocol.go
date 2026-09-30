@@ -14,13 +14,10 @@ const (
 	// connection, in response to an Open message.
 	DataPath = "/_tunler/data"
 
-	// LoginPath is a normal JSON POST endpoint used to create/authenticate a
-	// user with the server master password in exchange for a user secret.
+	// LoginPath is a normal JSON POST endpoint that trades a username and
+	// password for a user secret, creating the account (which also needs
+	// the server master password) when it does not exist yet.
 	LoginPath = "/_tunler/login"
-
-	// LoginVerifyPath (POST) finishes a login the server confirms by email:
-	// it trades the pending ID and the emailed code for the user secret.
-	LoginVerifyPath = "/_tunler/login/verify"
 
 	// LogoutPath (POST) revokes the presented secret server-side.
 	LogoutPath = "/_tunler/logout"
@@ -61,28 +58,19 @@ type Message struct {
 	Reason string `json:"reason,omitempty"` // TypeClose only
 }
 
-// LoginRequest creates (or re-authenticates) a user with the master password.
-// Verify declares that the client can finish an email-confirmed login; a
-// server that confirms logins by email refuses clients that cannot.
+// LoginRequest logs in with the account's own password. MasterPassword is
+// only needed to create an account; without it, logging in to an unknown
+// username fails with CodeMasterPasswordRequired.
 type LoginRequest struct {
-	Email    string `json:"email"`
-	Password string `json:"password"`
-	Verify   bool   `json:"verify,omitempty"`
+	Username       string `json:"username"`
+	Password       string `json:"password"`
+	MasterPassword string `json:"master_password,omitempty"`
 }
 
 // LoginResponse returns a freshly minted user secret. Every tunnel/domain
-// is scoped to the user this secret belongs to. When the server confirms
-// logins by email it answers 202 with Pending set instead, and the secret
-// comes from LoginVerifyPath once the emailed code is presented.
+// is scoped to the user this secret belongs to.
 type LoginResponse struct {
-	Secret  string `json:"secret,omitempty"`
-	Pending string `json:"pending,omitempty"`
-}
-
-// LoginVerifyRequest presents the code emailed for a pending login.
-type LoginVerifyRequest struct {
-	Pending string `json:"pending"`
-	Code    string `json:"code"`
+	Secret string `json:"secret"`
 }
 
 // DomainsResponse lists the domains owned by the authenticated user.
@@ -95,7 +83,13 @@ type ReleaseRequest struct {
 	Domain string `json:"domain"`
 }
 
-// ErrorResponse is the JSON body of any non-2xx /_tunler response.
+// ErrorResponse is the JSON body of any non-2xx /_tunler response. Code, when
+// set, tells clients what to do next.
 type ErrorResponse struct {
 	Error string `json:"error"`
+	Code  string `json:"code,omitempty"`
 }
+
+// CodeMasterPasswordRequired answers a login for a username that has no
+// account yet: send it again with the server master password to create it.
+const CodeMasterPasswordRequired = "master_password_required"

@@ -29,7 +29,8 @@ func TestStoreRoundtrip(t *testing.T) {
 
 	s := LoadStore()
 	s.DefaultHost = "tunler.example.com"
-	s.Hosts["tunler.example.com"] = HostCreds{Email: "me@x.nl", Secret: "s3cret"}
+	s.Hosts["tunler.example.com"] = HostCreds{User: "me", Secret: "s3cret"}
+	s.Hosts["old.example.com"] = HostCreds{Email: "me@x.nl", Secret: "old"} // saved by an older client
 	if err := s.Save(); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
@@ -38,8 +39,11 @@ func TestStoreRoundtrip(t *testing.T) {
 	if got.DefaultHost != "tunler.example.com" {
 		t.Errorf("DefaultHost = %q", got.DefaultHost)
 	}
-	if creds := got.Hosts["tunler.example.com"]; creds.Email != "me@x.nl" || creds.Secret != "s3cret" {
+	if creds := got.Hosts["tunler.example.com"]; creds.User != "me" || creds.Secret != "s3cret" {
 		t.Errorf("creds = %+v", creds)
+	}
+	if creds := got.Hosts["old.example.com"]; creds.User != "me@x.nl" {
+		t.Errorf("old email login not read as the username: %+v", creds)
 	}
 }
 

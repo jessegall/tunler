@@ -8,11 +8,10 @@
 // One-shot / CI (no prompts, no saved state):
 //
 //	tunler connect 8000 --host=tunler.example.com --domain=my-app --secret=XXX
-//	tunler connect 8000 --host=tunler.example.com --domain=my-app --email=you@example.com --password=XXX
+//	tunler connect 8000 --host=tunler.example.com --domain=my-app --user=you --password=XXX
 package main
 
 import (
-	"bufio"
 	"crypto/rand"
 	"encoding/json"
 	"errors"
@@ -111,21 +110,22 @@ func run(args []string) error {
 // opts are the shared flags; every subcommand accepts all of them so any
 // workflow can be expressed as one command.
 type opts struct {
-	host      string
-	domain    string
-	secret    string
-	email     string
-	password  string
-	auth      string
-	logFile   string
-	inspect   int
-	insecure  bool
-	noSave    bool
-	detached  bool
-	ephemeral bool
-	all       bool
-	jsonOut   bool
-	follow    bool
+	host           string
+	domain         string
+	secret         string
+	user           string
+	password       string
+	masterPassword string
+	auth           string
+	logFile        string
+	inspect        int
+	insecure       bool
+	noSave         bool
+	detached       bool
+	ephemeral      bool
+	all            bool
+	jsonOut        bool
+	follow         bool
 }
 
 // parse resolves flags and positionals for a subcommand. Flags and positional
@@ -138,8 +138,10 @@ func parse(name string, args []string) (opts, []string, error) {
 	fs.StringVar(&o.host, "host", os.Getenv("TUNLER_HOST"), "tunler server (or env TUNLER_HOST)")
 	fs.StringVar(&o.domain, "domain", "", "subdomain to use, e.g. my-app -> my-app.<host>")
 	fs.StringVar(&o.secret, "secret", os.Getenv("TUNLER_SECRET"), "user secret (or env TUNLER_SECRET)")
-	fs.StringVar(&o.email, "email", "", "user email (for inline login)")
-	fs.StringVar(&o.password, "password", os.Getenv("TUNLER_PASSWORD"), "master password (or env TUNLER_PASSWORD)")
+	fs.StringVar(&o.user, "user", "", "username (for inline login)")
+	fs.StringVar(&o.user, "email", "", "old name of --user")
+	fs.StringVar(&o.password, "password", os.Getenv("TUNLER_PASSWORD"), "account password (or env TUNLER_PASSWORD)")
+	fs.StringVar(&o.masterPassword, "master-password", os.Getenv("TUNLER_MASTER_PASSWORD"), "server master password, to create an account (or env TUNLER_MASTER_PASSWORD)")
 	fs.StringVar(&o.auth, "auth", os.Getenv("TUNLER_AUTH"), "require basic auth from visitors, e.g. --auth=user:pass")
 	fs.IntVar(&o.inspect, "inspect", 4646, "local web inspector port (0 to disable)")
 	fs.BoolVar(&o.insecure, "insecure", false, "connect over plain HTTP (local testing only)")
@@ -180,40 +182,33 @@ func resolveHost(flagHost string, store client.Store) string {
 }
 
 // creds resolves host and secret: flags/env first, then the saved login,
-// performing an inline login if an email/password was supplied.
+// performing an inline login if a username was supplied.
 func (o *opts) creds(needSecret bool) (client.Config, client.Store, error) {
 	store := client.LoadStore()
 	o.host = resolveHost(o.host, store)
 	if o.host == "" {
-		return client.Config{}, store, usageErr("no server given: pass --host=... (or run `tunler login <email> --host=...` once)")
+		return client.Config{}, store, usageErr("no server given: pass --host=... (or run `tunler login <username> --host=...` once)")
 	}
 	cfg := client.Config{Host: o.host, Domain: o.domain, Secret: o.secret, Insecure: o.insecure}
 
 	if cfg.Secret == "" {
 		if saved, ok := store.Hosts[o.host]; ok {
 			cfg.Secret = saved.Secret
-			if o.email == "" {
-				o.email = saved.Email
+			if o.user == "" {
+				o.user = saved.User
 			}
 		}
 	}
 
-	if cfg.Secret == "" && o.email != "" {
-		pw := o.password
-		if pw == "" {
-			var err error
-			if pw, err = promptPassword(o.host); err != nil {
-				return cfg, store, err
-			}
-		}
-		secret, err := client.Login(cfg, o.email, pw, func() (string, error) { return promptCode(o.email) })
+	if cfg.Secret == "" && o.user != "" {
+		secret, err := o.login(cfg)
 		if err != nil {
 			return cfg, store, fmt.Errorf("login failed: %w", err)
 		}
 		cfg.Secret = secret
 		if !o.noSave {
 			saved := store.Hosts[o.host]
-			saved.Email, saved.Secret = o.email, secret
+			saved.User, saved.Secret = o.user, secret
 			store.Hosts[o.host] = saved
 			if store.DefaultHost == "" {
 				store.DefaultHost = o.host
@@ -225,7 +220,7 @@ func (o *opts) creds(needSecret bool) (client.Config, client.Store, error) {
 	}
 
 	if needSecret && cfg.Secret == "" {
-		return cfg, store, usageErr("not logged in to %s: run `tunler login <email> --host=%s`, or pass --secret=... / --email=... --password=... directly", o.host, o.host)
+		return cfg, store, usageErr("not logged in to %s: run `tunler login <username> --host=%s`, or pass --secret=... / --user=... --password=... directly", o.host, o.host)
 	}
 	return cfg, store, nil
 }
@@ -343,7 +338,7 @@ func cmdConnect(args []string) error {
 		if authErr != nil {
 			cleanup()
 			if authErr.Status == http.StatusUnauthorized {
-				return fmt.Errorf("rejected by server: %v\n(hint: `tunler login <email> --host=%s` to refresh credentials)", authErr, cfg.Host)
+				return fmt.Errorf("rejected by server: %v\n(hint: `tunler login <username> --host=%s` to refresh credentials)", authErr, cfg.Host)
 			}
 			return fmt.Errorf("rejected by server: %v", authErr)
 		}
@@ -443,14 +438,15 @@ func cmdStatus(args []string) error {
 
 	type status struct {
 		Host     string `json:"host,omitempty"`
-		Email    string `json:"email,omitempty"`
+		User     string `json:"user,omitempty"`
+		Email    string `json:"email,omitempty"` // old name of user, kept for scripts
 		LoggedIn bool   `json:"logged_in"`
 		AuthOK   bool   `json:"auth_ok"`
 		Tunnels  int    `json:"tunnels"`
 	}
 	st := status{Host: host, Tunnels: len(readTunnels())}
 	if creds, ok := store.Hosts[host]; ok && host != "" {
-		st.Email = creds.Email
+		st.User, st.Email = creds.User, creds.User
 		st.LoggedIn = true
 		cfg := client.Config{Host: host, Secret: creds.Secret, Insecure: o.insecure}
 		if o.secret != "" {
@@ -464,14 +460,14 @@ func cmdStatus(args []string) error {
 	case o.jsonOut:
 		json.NewEncoder(os.Stdout).Encode(st)
 	case !st.LoggedIn:
-		fmt.Fprintf(os.Stderr, "not logged in (host: %q); run: tunler login <email> --host=<server>\n", host)
+		fmt.Fprintf(os.Stderr, "not logged in (host: %q); run: tunler login <username> --host=<server>\n", host)
 	default:
 		okStr := "ok"
 		if !st.AuthOK {
 			okStr = "FAILED, run tunler login again"
 		}
-		fmt.Printf("host:    %s\nemail:   %s\nauth:    %s\ntunnels: %d running (tunler list)\n",
-			st.Host, st.Email, okStr, st.Tunnels)
+		fmt.Printf("host:    %s\nuser:    %s\nauth:    %s\ntunnels: %d running (tunler list)\n",
+			st.Host, st.User, okStr, st.Tunnels)
 	}
 	if !st.LoggedIn || !st.AuthOK {
 		return errReported
@@ -486,27 +482,21 @@ func cmdLogin(args []string) error {
 	if err != nil {
 		return err
 	}
-	if len(positional) == 1 && o.email == "" {
-		o.email = positional[0]
+	if len(positional) == 1 && o.user == "" {
+		o.user = positional[0]
 	} else if len(positional) > 0 {
-		return usageErr("usage: tunler login <email> [--host=<server>] [--password=...]")
+		return usageErr("usage: tunler login <username> [--host=<server>] [--password=...|--secret=...]")
 	}
-	if o.email == "" {
-		return usageErr("usage: tunler login <email> [--host=<server>] [--password=...]")
+	if o.user == "" {
+		return usageErr("usage: tunler login <username> [--host=<server>] [--password=...|--secret=...]")
 	}
 	o.host = resolveHost(o.host, client.LoadStore())
 	if o.host == "" {
-		return usageErr("no server given: tunler login <email> --host=tunler.example.com")
+		return usageErr("no server given: tunler login <username> --host=tunler.example.com")
 	}
 
-	pw := o.password
-	if pw == "" {
-		if pw, err = promptPassword(o.host); err != nil {
-			return err
-		}
-	}
 	cfg := client.Config{Host: o.host, Insecure: o.insecure}
-	secret, err := client.Login(cfg, o.email, pw, func() (string, error) { return promptCode(o.email) })
+	secret, err := o.login(cfg)
 	if err != nil {
 		return fmt.Errorf("login failed: %w", err)
 	}
@@ -518,13 +508,13 @@ func cmdLogin(args []string) error {
 	}
 	store := client.LoadStore()
 	saved := store.Hosts[o.host]
-	saved.Email, saved.Secret = o.email, secret
+	saved.User, saved.Secret = o.user, secret
 	store.Hosts[o.host] = saved
 	store.DefaultHost = o.host
 	if err := store.Save(); err != nil {
 		return fmt.Errorf("could not save credentials: %w", err)
 	}
-	fmt.Fprintf(os.Stderr, "Logged in to %s as %s (saved; %s is now the default host).\n", o.host, o.email, o.host)
+	fmt.Fprintf(os.Stderr, "Logged in to %s as %s (saved; %s is now the default host).\n", o.host, o.user, o.host)
 	return nil
 }
 
@@ -617,15 +607,34 @@ func cmdRelease(args []string) error {
 
 // --- helpers ---
 
+// login logs in as o.user, prompting for the account password and, when the
+// account has to be created first, for the server master password.
+func (o *opts) login(cfg client.Config) (string, error) {
+	pw := o.password
+	if pw == "" {
+		var err error
+		if pw, err = promptPassword(fmt.Sprintf("Password for %s on %s: ", o.user, o.host), "--password"); err != nil {
+			return "", err
+		}
+	}
+	return client.Login(cfg, o.user, pw, func() (string, error) {
+		if o.masterPassword != "" {
+			return o.masterPassword, nil
+		}
+		fmt.Fprintf(os.Stderr, "There is no account %q on %s yet; creating it needs the server's master password.\n", o.user, o.host)
+		return promptPassword(fmt.Sprintf("Master password for %s: ", o.host), "--master-password")
+	})
+}
+
 // promptPassword reads a password without echo. It reads the terminal in raw
 // mode byte by byte because raw mode disables signal handling, so Ctrl+C must be
 // recognized by hand or the prompt cannot be exited.
-func promptPassword(host string) (string, error) {
+func promptPassword(prompt, flag string) (string, error) {
 	fd := int(os.Stdin.Fd())
 	if !term.IsTerminal(fd) {
-		return "", errors.New("password required: pass --password=... (or env TUNLER_PASSWORD) when not interactive")
+		return "", fmt.Errorf("password required: pass %s=... when not interactive", flag)
 	}
-	fmt.Fprintf(os.Stderr, "Master password for %s: ", host)
+	fmt.Fprint(os.Stderr, prompt)
 
 	state, err := term.MakeRaw(fd)
 	if err != nil {
@@ -659,17 +668,6 @@ func promptPassword(host string) (string, error) {
 	return string(pw), nil
 }
 
-// promptCode asks for the login code the server emailed. It reads one line
-// from stdin, so a script can pipe the code in too.
-func promptCode(email string) (string, error) {
-	fmt.Fprintf(os.Stderr, "A login code was sent to %s. Code: ", email)
-	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
-	if err != nil && line == "" {
-		return "", fmt.Errorf("cannot read login code: %w", err)
-	}
-	return strings.TrimSpace(line), nil
-}
-
 // isTarget reports whether s looks like a connect target ("8000",
 // "localhost:3000"), which makes bare `tunler 8000 ...` work.
 func isTarget(s string) bool {
@@ -697,7 +695,7 @@ func usage() {
 	fmt.Fprintf(os.Stderr, `tunler %s: expose a local port on a public subdomain
 
 USAGE
-  tunler login <email> --host=<server> [--password=...]   authenticate once, saved locally
+  tunler login <username> --host=<server>                  log in (first time: creates the account)
   tunler connect <port|host:port> [--domain=<name>]       start a tunnel (or just: tunler 8000)
   tunler list                                             list running tunnels
   tunler disconnect [<domain>|--all]                      stop background tunnel(s)
@@ -714,15 +712,18 @@ EXAMPLES
   tunler 8000                          random ephemeral subdomain, released on exit
   tunler 8000 --domain=my-app -d       run in the background
   tunler 8000 --auth=user:pass         visitors must pass basic auth
-  tunler connect 8000 --host=tunler.example.com --domain=x --password=XXX
+  tunler connect 8000 --host=tunler.example.com --domain=x --secret=XXX
                                        one-shot, no prompts, no saved state (CI)
 
 FLAGS (all commands; flags/env always override the saved config)
   --host=      tunler server (env TUNLER_HOST)
   --domain=    subdomain to use (omit for a random ephemeral one)
   --secret=    user secret (env TUNLER_SECRET)
-  --email=     user email, for (inline) login
-  --password=  master password (env TUNLER_PASSWORD)
+  --user=      username, for (inline) login
+  --password=  account password (env TUNLER_PASSWORD)
+  --master-password=
+               server master password, only to create an account or
+               download from a gated server (env TUNLER_MASTER_PASSWORD)
   --auth=      user:pass required from visitors of the tunnel
   --inspect=   local web inspector port (default 4646, 0 = off)
   -d           run tunnel in the background (--detached)

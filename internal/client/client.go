@@ -102,7 +102,7 @@ func (c Config) api(method, path string, body, out any) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode/100 != 2 {
-		return errors.New(readError(resp))
+		return apiError(resp)
 	}
 	if out != nil {
 		if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
@@ -112,23 +112,39 @@ func (c Config) api(method, path string, body, out any) error {
 	return nil
 }
 
-// Login exchanges the master password for a user secret. When the server
-// confirms logins by email, code is called to ask for the code it mailed.
-func Login(cfg Config, email, password string, code func() (string, error)) (string, error) {
+// Login trades a username and the account's password for a user secret.
+// When the account does not exist yet the server asks for its master
+// password to create it; master is then called to supply it.
+func Login(cfg Config, user, password string, master func() (string, error)) (string, error) {
+	req := protocol.LoginRequest{Username: user, Password: password}
 	var out protocol.LoginResponse
-	err := cfg.api(http.MethodPost, protocol.LoginPath,
-		protocol.LoginRequest{Email: email, Password: password, Verify: true}, &out)
-	if err != nil || out.Pending == "" {
-		return out.Secret, err
+	err := cfg.api(http.MethodPost, protocol.LoginPath, req, &out)
+	var apiErr *APIError
+	if errors.As(err, &apiErr) && apiErr.Code == protocol.CodeMasterPasswordRequired {
+		if req.MasterPassword, err = master(); err != nil {
+			return "", err
+		}
+		err = cfg.api(http.MethodPost, protocol.LoginPath, req, &out)
 	}
-	c, err := code()
-	if err != nil {
-		return "", err
+	return out.Secret, err
+}
+
+// APIError is a non-2xx answer from a /_tunler endpoint.
+type APIError struct {
+	Status int
+	Code   string // protocol.Code*, when the server gave one
+	msg    string
+}
+
+func (e *APIError) Error() string { return e.msg }
+
+func apiError(resp *http.Response) *APIError {
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	var e protocol.ErrorResponse
+	if json.Unmarshal(body, &e) == nil && e.Error != "" {
+		return &APIError{Status: resp.StatusCode, Code: e.Code, msg: fmt.Sprintf("%s (%s)", e.Error, resp.Status)}
 	}
-	var verified protocol.LoginResponse
-	err = cfg.api(http.MethodPost, protocol.LoginVerifyPath,
-		protocol.LoginVerifyRequest{Pending: out.Pending, Code: strings.TrimSpace(c)}, &verified)
-	return verified.Secret, err
+	return &APIError{Status: resp.StatusCode, msg: resp.Status}
 }
 
 // Logout revokes cfg.Secret server-side.
@@ -350,12 +366,7 @@ func upgrade(cfg Config, path string, extra map[string]string) (net.Conn, *bufio
 
 // readError extracts a human-readable message from an error response.
 func readError(resp *http.Response) string {
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-	var e protocol.ErrorResponse
-	if json.Unmarshal(body, &e) == nil && e.Error != "" {
-		return fmt.Sprintf("%s (%s)", e.Error, resp.Status)
-	}
-	return resp.Status
+	return apiError(resp).Error()
 }
 
 func stripPort(host string) string {

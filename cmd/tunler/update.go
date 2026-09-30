@@ -51,18 +51,22 @@ func cmdUpdate(args []string) error {
 
 	// A server that gates downloads wants the master password as basic
 	// auth, the same as the install script sends.
+	master := o.masterPassword
+	if master == "" {
+		master = o.password // what TUNLER_PASSWORD meant before accounts had passwords
+	}
 	get := func(c *http.Client, url string) (*http.Response, error) {
 		req, err := http.NewRequest(http.MethodGet, url, nil)
 		if err != nil {
 			return nil, err
 		}
-		if o.password != "" {
-			req.SetBasicAuth("tunler", o.password)
+		if master != "" {
+			req.SetBasicAuth("tunler", master)
 		}
 		resp, err := c.Do(req)
 		if err == nil && resp.StatusCode == http.StatusUnauthorized {
 			resp.Body.Close()
-			return nil, errors.New("the server requires the master password for downloads: set TUNLER_PASSWORD or pass --password")
+			return nil, errors.New("the server requires its master password for downloads: set TUNLER_MASTER_PASSWORD or pass --master-password")
 		}
 		return resp, err
 	}

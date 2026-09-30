@@ -28,23 +28,10 @@ type Config struct {
 	Limits       Limits       `json:"limits"`
 	Lockout      Lockout      `json:"lockout"`
 	Registration Registration `json:"registration"`
-	SMTP         SMTP         `json:"smtp"`
+	// AccountExpiry removes accounts idle this long, with their domains,
+	// so names do not stay claimed forever; 0 keeps accounts forever.
+	AccountExpiry Duration `json:"account_expiry"`
 }
-
-// SMTP configures the mail server that sends login codes. With a Host set,
-// every login is confirmed by a code emailed to the address, so the master
-// password alone cannot log in as someone else. Without it, anyone with the
-// master password can log in as any email.
-type SMTP struct {
-	Host     string `json:"host"`
-	Port     int    `json:"port"` // 587 (STARTTLS) by default; 465 means implicit TLS
-	Username string `json:"username"`
-	Password string `json:"password"`
-	From     string `json:"from"` // sender address
-}
-
-// Enabled reports whether logins are confirmed by email.
-func (m SMTP) Enabled() bool { return m.Host != "" }
 
 // Downloads controls the /install and /dl/ endpoints.
 type Downloads struct {
@@ -70,8 +57,8 @@ type Lockout struct {
 
 // Registration controls who may create an account via login.
 type Registration struct {
-	Mode      string   `json:"mode"`      // "open" (any email) or "allowlist"
-	Allowlist []string `json:"allowlist"` // permitted emails when Mode == "allowlist"
+	Mode      string   `json:"mode"`      // "open" (any username) or "allowlist"
+	Allowlist []string `json:"allowlist"` // permitted usernames when Mode == "allowlist"
 }
 
 // DefaultConfig returns the built-in defaults that every config starts from.
@@ -85,8 +72,9 @@ func DefaultConfig() Config {
 			ResponseHeaderTimeout: Duration(30 * time.Second),
 			DataConnIdleTimeout:   Duration(5 * time.Minute),
 		},
-		Lockout:      Lockout{Enabled: true, Threshold: 5, MaxBackoff: Duration(15 * time.Minute)},
-		Registration: Registration{Mode: "open"},
+		Lockout:       Lockout{Enabled: true, Threshold: 5, MaxBackoff: Duration(15 * time.Minute)},
+		Registration:  Registration{Mode: "open"},
+		AccountExpiry: Duration(30 * 24 * time.Hour),
 	}
 }
 
@@ -138,13 +126,14 @@ func sha256Hex(s string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// allowsEmail reports whether email may register under this configuration.
-func (r Registration) allowsEmail(email string) bool {
+// allowsUser reports whether a (lowercased) username may register under this
+// configuration.
+func (r Registration) allowsUser(user string) bool {
 	if r.Mode != "allowlist" {
 		return true
 	}
-	for _, e := range r.Allowlist {
-		if e == email {
+	for _, u := range r.Allowlist {
+		if strings.EqualFold(u, user) {
 			return true
 		}
 	}

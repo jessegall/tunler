@@ -91,37 +91,40 @@ func TestInspectorRejectsForeignHost(t *testing.T) {
 	}
 }
 
-func TestLoginWithEmailedCode(t *testing.T) {
+func TestLoginAsksForMasterPasswordOnlyToCreate(t *testing.T) {
+	accounts := map[string]string{"old": "old-pw"}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case protocol.LoginPath:
-			var req protocol.LoginRequest
-			json.NewDecoder(r.Body).Decode(&req)
-			if !req.Verify {
-				w.WriteHeader(http.StatusBadRequest)
-				return
-			}
-			w.WriteHeader(http.StatusAccepted)
-			json.NewEncoder(w).Encode(protocol.LoginResponse{Pending: "p1"})
-		case protocol.LoginVerifyPath:
-			var req protocol.LoginVerifyRequest
-			json.NewDecoder(r.Body).Decode(&req)
-			if req.Pending != "p1" || req.Code != "123456" {
-				w.WriteHeader(http.StatusUnauthorized)
-				return
-			}
-			json.NewEncoder(w).Encode(protocol.LoginResponse{Secret: "s3cret"})
+		var req protocol.LoginRequest
+		json.NewDecoder(r.Body).Decode(&req)
+		pw, exists := accounts[req.Username]
+		switch {
+		case exists && pw == req.Password:
+			json.NewEncoder(w).Encode(protocol.LoginResponse{Secret: "s-" + req.Username})
+		case exists:
+			w.WriteHeader(http.StatusUnauthorized)
+		case req.MasterPassword == "":
+			w.WriteHeader(http.StatusUnauthorized)
+			json.NewEncoder(w).Encode(protocol.ErrorResponse{Error: "no account", Code: protocol.CodeMasterPasswordRequired})
+		case req.MasterPassword == "master":
+			accounts[req.Username] = req.Password
+			json.NewEncoder(w).Encode(protocol.LoginResponse{Secret: "s-" + req.Username})
+		default:
+			w.WriteHeader(http.StatusUnauthorized)
 		}
 	}))
 	defer srv.Close()
 	cfg := Config{Host: strings.TrimPrefix(srv.URL, "http://"), Insecure: true}
+	asked := 0
+	master := func() (string, error) { asked++; return "master", nil }
 
-	secret, err := Login(cfg, "me@x.nl", "pw", func() (string, error) { return " 123456\n", nil })
-	if err != nil || secret != "s3cret" {
-		t.Fatalf("Login = %q, %v; want s3cret", secret, err)
+	if secret, err := Login(cfg, "old", "old-pw", master); err != nil || secret != "s-old" || asked != 0 {
+		t.Fatalf("existing account: %q, %v, master asked %d times", secret, err, asked)
 	}
-	if _, err := Login(cfg, "me@x.nl", "pw", func() (string, error) { return "", errors.New("no tty") }); err == nil {
-		t.Fatal("Login succeeded without a code")
+	if secret, err := Login(cfg, "new", "new-pw", master); err != nil || secret != "s-new" || asked != 1 {
+		t.Fatalf("new account: %q, %v, master asked %d times", secret, err, asked)
+	}
+	if _, err := Login(cfg, "other", "pw", func() (string, error) { return "", errors.New("no tty") }); err == nil {
+		t.Fatal("created an account without the master password")
 	}
 }
 

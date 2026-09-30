@@ -36,6 +36,9 @@ const (
 	// maxBackoffShift caps the lockout's doubling so time.Minute<<n can never
 	// overflow into a negative (i.e. already expired) lock.
 	maxBackoffShift = 20
+
+	// minPasswordLen is the shortest account password accepted.
+	minPasswordLen = 8
 )
 
 // Version is stamped at build time via -ldflags.
@@ -59,18 +62,15 @@ type Server struct {
 	mu      sync.Mutex
 	tunnels map[string]*tunnel // active tunnels by domain label
 
-	// Login lockout. With Traefik TCP passthrough the visitor IP is not
-	// recoverable, so the backoff is global; see Config.Lockout. loginMu is
-	// held for the whole of each master-password check, so parallel guesses
-	// cannot all pass the lockout before the first failure arms it.
-	loginMu    sync.Mutex
-	loginFails int
-	loginLock  time.Time
+	// Password lockouts, one per password: "" is the master password, other
+	// keys are usernames. With Traefik TCP passthrough the visitor IP is not
+	// recoverable, so the backoff cannot be per client; see Config.Lockout.
+	// loginMu is held for the whole of each check, so parallel guesses
+	// cannot all pass a lockout before the first failure arms it.
+	loginMu sync.Mutex
+	locks   map[string]*lockState
 
 	syncMu sync.Mutex // serializes SyncTraefik
-
-	mailer mailer // sends login codes; nil when logins are not confirmed by email
-	codes  loginCodes
 
 	proxy *httputil.ReverseProxy
 }
@@ -108,13 +108,7 @@ func New(cfg Config, state *State) *Server {
 		state:    state,
 		reserved: reserved,
 		tunnels:  map[string]*tunnel{},
-		codes: loginCodes{
-			pending: map[string]*pendingLogin{},
-			sent:    map[string][]time.Time{},
-		},
-	}
-	if cfg.SMTP.Enabled() {
-		s.mailer = smtpMailer{cfg.SMTP}
+		locks:    map[string]*lockState{},
 	}
 	s.proxy = &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
@@ -176,8 +170,6 @@ func (s *Server) serveControlPlane(w http.ResponseWriter, r *http.Request) {
 	switch r.URL.Path {
 	case protocol.LoginPath:
 		s.handleLogin(w, r)
-	case protocol.LoginVerifyPath:
-		s.handleLoginVerify(w, r)
 	case protocol.LogoutPath:
 		s.handleLogout(w, r)
 	case protocol.DomainsPath:
@@ -237,11 +229,12 @@ func (s *Server) serveTunnel(w http.ResponseWriter, r *http.Request, label strin
 
 // --- user accounts ---
 
-// handleLogin exchanges the master password for a new user secret, creating
-// the user on first login. Each login mints an additional secret, so logging
-// in from a second machine doesn't invalidate the first. When SMTP is set up
-// the secret is only minted once the code emailed to the address comes back
-// through handleLoginVerify.
+// handleLogin trades a username and the account's own password for a user
+// secret; each login mints another secret, so machines don't invalidate
+// each other. A username without an account is created, which also takes
+// the server master password, so only people the operator trusts can sign
+// up. Forgotten passwords are not recovered: make a new account, and the old
+// one expires with its domains after cfg.AccountExpiry.
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		httpError(w, http.StatusMethodNotAllowed, "POST required")
@@ -252,119 +245,139 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, "invalid JSON")
 		return
 	}
+	if req.Username == "" {
+		httpError(w, http.StatusBadRequest, "this server logs in with a username and password; update the client with `tunler update`")
+		return
+	}
+	user := strings.ToLower(req.Username)
+	if !ValidUsername(user) {
+		httpError(w, http.StatusBadRequest, "invalid username: use lowercase letters, digits and . _ @ + -")
+		return
+	}
 
-	ok, wait := s.checkMasterPassword(req.Password, r.RemoteAddr)
+	if hash, exists := s.state.UserPassword(user); exists {
+		ok, wait := s.checkPassword(user, req.Password, hash, r.RemoteAddr)
+		if wait > 0 {
+			tooManyAttempts(w, wait)
+			return
+		}
+		if !ok {
+			time.Sleep(loginFailDelay)
+			httpError(w, http.StatusUnauthorized, "wrong username or password")
+			return
+		}
+		secret, err := s.state.AddSecret(user)
+		if err != nil {
+			httpError(w, http.StatusInternalServerError, "could not store login")
+			return
+		}
+		log.Printf("login: %s from %s", user, r.RemoteAddr)
+		writeJSON(w, protocol.LoginResponse{Secret: secret})
+		return
+	}
+
+	// No account yet: create one.
+	if !s.cfg.Registration.allowsUser(user) {
+		httpError(w, http.StatusForbidden, "username is not permitted to register on this server")
+		return
+	}
+	if len(req.Password) < minPasswordLen {
+		httpError(w, http.StatusBadRequest, fmt.Sprintf("choose a password of at least %d characters", minPasswordLen))
+		return
+	}
+	if req.MasterPassword == "" {
+		httpErrorCode(w, http.StatusUnauthorized, protocol.CodeMasterPasswordRequired,
+			fmt.Sprintf("there is no account %q yet; creating it needs the server's master password", user))
+		return
+	}
+	ok, wait := s.checkMasterPassword(req.MasterPassword, r.RemoteAddr)
 	if wait > 0 {
-		w.Header().Set("Retry-After", fmt.Sprintf("%.0f", wait.Seconds()))
-		httpError(w, http.StatusTooManyRequests,
-			fmt.Sprintf("too many failed logins; retry in %s", wait.Round(time.Second)))
+		tooManyAttempts(w, wait)
 		return
 	}
 	if !ok {
 		time.Sleep(loginFailDelay)
-		httpError(w, http.StatusUnauthorized, "invalid password")
+		httpError(w, http.StatusUnauthorized, "invalid master password")
 		return
 	}
-
-	if !ValidEmail(req.Email) {
-		httpError(w, http.StatusBadRequest, "invalid email address")
-		return
-	}
-	if !s.cfg.Registration.allowsEmail(req.Email) {
-		httpError(w, http.StatusForbidden, "email is not permitted to register on this server")
-		return
-	}
-	if s.mailer != nil {
-		if !req.Verify {
-			httpError(w, http.StatusBadRequest, "this server confirms logins by email; update the client with `tunler update`")
-			return
-		}
-		id, err := s.codes.start(s.mailer, s.cfg.Domain, req.Email)
-		switch {
-		case errors.Is(err, errTooManyCodes):
-			httpError(w, http.StatusTooManyRequests, err.Error())
-			return
-		case err != nil:
-			log.Printf("login code for %s not sent: %v", req.Email, err)
-			httpError(w, http.StatusBadGateway, "could not send the login code")
-			return
-		}
-		log.Printf("login code sent: %s from %s", req.Email, r.RemoteAddr)
-		writeJSONStatus(w, http.StatusAccepted, protocol.LoginResponse{Pending: id})
-		return
-	}
-	s.issueSecret(w, r, req.Email)
-}
-
-// handleLoginVerify finishes an email-confirmed login: the pending ID and the
-// emailed code buy a user secret.
-func (s *Server) handleLoginVerify(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		httpError(w, http.StatusMethodNotAllowed, "POST required")
-		return
-	}
-	if s.mailer == nil {
-		httpError(w, http.StatusNotFound, "this server does not confirm logins by email")
-		return
-	}
-	var req protocol.LoginVerifyRequest
-	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil {
-		httpError(w, http.StatusBadRequest, "invalid JSON")
-		return
-	}
-	email, err := s.codes.finish(req.Pending, req.Code)
+	hash, err := HashPassword(req.Password)
 	if err != nil {
-		time.Sleep(loginFailDelay)
-		httpError(w, http.StatusUnauthorized, err.Error())
+		httpError(w, http.StatusInternalServerError, "could not hash password")
 		return
 	}
-	s.issueSecret(w, r, email)
-}
-
-// issueSecret mints a secret for email and returns it.
-func (s *Server) issueSecret(w http.ResponseWriter, r *http.Request, email string) {
-	secret, err := s.state.AddSecret(email)
+	secret, err := s.state.CreateUser(user, hash)
+	if errors.Is(err, ErrUserTaken) { // created by a concurrent request
+		httpError(w, http.StatusConflict, "username is taken")
+		return
+	}
 	if err != nil {
 		httpError(w, http.StatusInternalServerError, "could not store user")
 		return
 	}
-	log.Printf("login: %s from %s", email, r.RemoteAddr)
+	log.Printf("account created: %s from %s", user, r.RemoteAddr)
 	writeJSON(w, protocol.LoginResponse{Secret: secret})
 }
 
-// checkMasterPassword verifies one master-password attempt under the global
-// lockout, for logins and gated downloads alike. It returns how long the
-// lockout still runs when locked (the password is then not checked at all).
-// Checks are serialized under loginMu, so each failure arms the lock before
-// the next attempt is looked at.
+func tooManyAttempts(w http.ResponseWriter, wait time.Duration) {
+	w.Header().Set("Retry-After", fmt.Sprintf("%.0f", wait.Seconds()))
+	httpError(w, http.StatusTooManyRequests,
+		fmt.Sprintf("too many failed attempts; retry in %s", wait.Round(time.Second)))
+}
+
+// checkMasterPassword verifies one master-password attempt under its global
+// lockout, for account creation and gated downloads alike.
 func (s *Server) checkMasterPassword(password, remoteAddr string) (ok bool, wait time.Duration) {
+	return s.checkPassword("", password, s.cfg.PasswordHash, remoteAddr)
+}
+
+// checkPassword verifies one attempt at the password behind key ("" for the
+// master password, else a username) under that key's lockout. It returns
+// how long the lockout still runs when locked (the password is then not
+// checked at all). Checks are serialized under loginMu, so each failure arms
+// the lock before the next attempt is looked at.
+func (s *Server) checkPassword(key, password, hash, remoteAddr string) (ok bool, wait time.Duration) {
 	s.loginMu.Lock()
 	defer s.loginMu.Unlock()
+	l := s.locks[key]
+	if l == nil {
+		l = &lockState{}
+		s.locks[key] = l
+	}
 	if s.cfg.Lockout.Enabled {
-		if wait := time.Until(s.loginLock); wait > 0 {
+		if wait := time.Until(l.until); wait > 0 {
 			return false, wait
 		}
 	}
-	if VerifyPassword(password, s.cfg.PasswordHash) {
-		s.loginFails = 0
+	if VerifyPassword(password, hash) {
+		delete(s.locks, key)
 		return true, 0
 	}
-	s.recordLoginFailure(remoteAddr)
+	s.recordLoginFailure(l, key, remoteAddr)
 	return false, 0
 }
 
-// recordLoginFailure escalates the global lockout after enough failures. It
-// must be called with loginMu held.
-func (s *Server) recordLoginFailure(remoteAddr string) {
+// recordLoginFailure escalates key's lockout after enough failures. It must
+// be called with loginMu held.
+func (s *Server) recordLoginFailure(l *lockState, key, remoteAddr string) {
 	if !s.cfg.Lockout.Enabled {
 		return
 	}
-	s.loginFails++
-	if over := s.loginFails - s.cfg.Lockout.Threshold; over >= 0 {
+	l.fails++
+	if over := l.fails - s.cfg.Lockout.Threshold; over >= 0 {
 		backoff := min(time.Minute<<min(over, maxBackoffShift), time.Duration(s.cfg.Lockout.MaxBackoff))
-		s.loginLock = time.Now().Add(backoff)
-		log.Printf("login locked for %s after %d failures (last from %s)", backoff, s.loginFails, remoteAddr)
+		l.until = time.Now().Add(backoff)
+		what := "master password"
+		if key != "" {
+			what = "login for " + key
+		}
+		log.Printf("%s locked for %s after %d failures (last from %s)", what, backoff, l.fails, remoteAddr)
 	}
+}
+
+// lockState is the lockout of one password.
+type lockState struct {
+	fails int
+	until time.Time
 }
 
 // handleLogout revokes the presented secret.
@@ -373,7 +386,7 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusMethodNotAllowed, "POST required")
 		return
 	}
-	email, ok := s.authUser(w, r)
+	user, ok := s.authUser(w, r)
 	if !ok {
 		return
 	}
@@ -381,17 +394,17 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusInternalServerError, "could not revoke secret")
 		return
 	}
-	log.Printf("logout: %s", email)
+	log.Printf("logout: %s", user)
 	w.WriteHeader(http.StatusNoContent)
 }
 
 // handleDomains lists the authenticated user's claimed domains.
 func (s *Server) handleDomains(w http.ResponseWriter, r *http.Request) {
-	email, ok := s.authUser(w, r)
+	user, ok := s.authUser(w, r)
 	if !ok {
 		return
 	}
-	writeJSON(w, protocol.DomainsResponse{Domains: s.state.DomainsOf(email)})
+	writeJSON(w, protocol.DomainsResponse{Domains: s.state.DomainsOf(user)})
 }
 
 // handleRelease unclaims a domain owned by the authenticated user.
@@ -400,7 +413,7 @@ func (s *Server) handleRelease(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusMethodNotAllowed, "POST required")
 		return
 	}
-	email, ok := s.authUser(w, r)
+	user, ok := s.authUser(w, r)
 	if !ok {
 		return
 	}
@@ -409,11 +422,11 @@ func (s *Server) handleRelease(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, "invalid JSON")
 		return
 	}
-	if err := s.state.Release(req.Domain, email); err != nil {
+	if err := s.state.Release(req.Domain, user); err != nil {
 		httpError(w, releaseStatus(err), err.Error())
 		return
 	}
-	log.Printf("released domain %q by %s", req.Domain, email)
+	log.Printf("released domain %q by %s", req.Domain, user)
 	s.closeTunnel(req.Domain, "domain released")
 	s.syncTraefikLogged()
 	w.WriteHeader(http.StatusNoContent)
@@ -447,7 +460,7 @@ func releaseStatus(err error) int {
 // --- control channel ---
 
 func (s *Server) handleControl(w http.ResponseWriter, r *http.Request) {
-	domain, email, ok := s.authTunnel(w, r)
+	domain, user, ok := s.authTunnel(w, r)
 	if !ok {
 		return
 	}
@@ -455,13 +468,13 @@ func (s *Server) handleControl(w http.ResponseWriter, r *http.Request) {
 	// First use claims the domain for this user; from then on only their
 	// secrets can tunnel on it. The claim is atomic, so cert/Traefik setup
 	// keys off a single trustworthy signal.
-	newlyClaimed, err := s.state.Claim(domain, email)
+	newlyClaimed, err := s.state.Claim(domain, user)
 	if err != nil {
 		httpError(w, http.StatusForbidden, err.Error())
 		return
 	}
 	if newlyClaimed {
-		log.Printf("domain %q claimed by %s", domain, email)
+		log.Printf("domain %q claimed by %s", domain, user)
 		s.syncTraefikLogged()
 	}
 
@@ -518,7 +531,7 @@ func (s *Server) handleControl(w http.ResponseWriter, r *http.Request) {
 	s.tunnels[domain] = t
 	s.mu.Unlock()
 
-	log.Printf("tunnel up: %s.%s (%s) from %s", domain, s.cfg.Domain, email, conn.RemoteAddr())
+	log.Printf("tunnel up: %s.%s (%s) from %s", domain, s.cfg.Domain, user, conn.RemoteAddr())
 	s.runControl(t, br)
 	s.removeTunnel(t)
 	log.Printf("tunnel down: %s.%s", domain, s.cfg.Domain)
@@ -739,34 +752,75 @@ func (c *dataConn) Close() error {
 
 // --- auth helpers ---
 
-// authUser resolves the presented secret to a user email.
+// authUser resolves the presented secret to a user user.
 func (s *Server) authUser(w http.ResponseWriter, r *http.Request) (string, bool) {
-	email, ok := s.state.UserBySecret(r.Header.Get(protocol.HeaderSecret))
+	user, ok := s.state.UserBySecret(r.Header.Get(protocol.HeaderSecret))
 	if !ok {
 		httpError(w, http.StatusUnauthorized, "invalid or expired secret; run `tunler login`")
 		return "", false
 	}
-	return email, true
+	s.state.Touch(user)
+	return user, true
+}
+
+// ExpireAccounts removes accounts idle longer than cfg.AccountExpiry and
+// releases their domains. A user with a live tunnel counts as active.
+func (s *Server) ExpireAccounts() {
+	if s.cfg.AccountExpiry <= 0 {
+		return
+	}
+	s.mu.Lock()
+	var live []string
+	for domain := range s.tunnels {
+		live = append(live, domain)
+	}
+	s.mu.Unlock()
+	for _, domain := range live {
+		if owner, ok := s.state.Owner(domain); ok {
+			s.state.Touch(owner)
+		}
+	}
+	released, err := s.state.Expire(time.Duration(s.cfg.AccountExpiry))
+	if err != nil {
+		log.Printf("warning: could not expire idle accounts: %v", err)
+		return
+	}
+	if len(released) == 0 {
+		return
+	}
+	for _, domain := range released {
+		s.closeTunnel(domain, "account expired")
+	}
+	log.Printf("expired idle accounts; released %d domain(s)", len(released))
+	s.syncTraefikLogged()
+}
+
+// ExpireAccountsEvery runs ExpireAccounts on a fixed interval, forever.
+func (s *Server) ExpireAccountsEvery(interval time.Duration) {
+	for {
+		s.ExpireAccounts()
+		time.Sleep(interval)
+	}
 }
 
 // authTunnel authenticates a control/data request: valid, non-reserved domain
 // label, a valid user secret, and (if the domain is claimed) ownership by
 // that user.
-func (s *Server) authTunnel(w http.ResponseWriter, r *http.Request) (domain, email string, ok bool) {
+func (s *Server) authTunnel(w http.ResponseWriter, r *http.Request) (domain, user string, ok bool) {
 	domain = r.Header.Get(protocol.HeaderDomain)
 	if !ValidDomain(domain) || s.reserved[domain] {
 		httpError(w, http.StatusBadRequest, "invalid or reserved domain")
 		return "", "", false
 	}
-	email, ok = s.authUser(w, r)
+	user, ok = s.authUser(w, r)
 	if !ok {
 		return "", "", false
 	}
-	if owner, taken := s.state.Owner(domain); taken && owner != email {
+	if owner, taken := s.state.Owner(domain); taken && owner != user {
 		httpError(w, http.StatusForbidden, "domain is owned by another user")
 		return "", "", false
 	}
-	return domain, email, true
+	return domain, user, true
 }
 
 // AllowHost is autocert's HostPolicy: issue certificates only for the base
@@ -848,19 +902,18 @@ type bufferedConn struct {
 func (c *bufferedConn) Read(p []byte) (int, error) { return c.r.Read(p) }
 
 func writeJSON(w http.ResponseWriter, v any) {
-	writeJSONStatus(w, http.StatusOK, v)
-}
-
-func writeJSONStatus(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(code)
 	json.NewEncoder(w).Encode(v)
 }
 
 func httpError(w http.ResponseWriter, code int, msg string) {
+	httpErrorCode(w, code, "", msg)
+}
+
+func httpErrorCode(w http.ResponseWriter, status int, code, msg string) {
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(code)
-	json.NewEncoder(w).Encode(protocol.ErrorResponse{Error: msg})
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(protocol.ErrorResponse{Error: msg, Code: code})
 }
 
 func randomToken(n int) (string, error) {

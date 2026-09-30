@@ -38,12 +38,16 @@ curl -fsSL https://tunler.example.com/install | sh
 **3. Log in once, then tunnel:**
 
 ```sh
-tunler login you@example.com            # prompts for the master password
+tunler login you                        # pick a password; the first time it also
+                                        # asks for the server's master password
 tunler 8000                             # → https://<random>.tunler.example.com
 tunler 8000 --domain=my-app             # → https://my-app.tunler.example.com
 ```
 
-The first user to use a subdomain owns it; nobody else can tunnel on it.
+The first user to use a subdomain owns it; nobody else can tunnel on it. On
+another machine, `tunler login you` with the same password gets you in. A
+forgotten password cannot be recovered: make a new account. Accounts unused for
+30 days are deleted with their subdomains, and the username is free again.
 
 ## Running a server
 
@@ -116,22 +120,10 @@ the server's posture:
     "data_conn_idle_timeout": "5m"
   },
   "lockout": { "enabled": true, "threshold": 5, "max_backoff": "15m" },
-  "registration": { "mode": "allowlist", "allowlist": ["you@example.com"] },
-  "smtp": {                                    // confirm every login by email
-    "host": "smtp.example.com",
-    "port": 587,                               // STARTTLS; 465 = implicit TLS
-    "username": "tunler@example.com",
-    "from": "tunler@example.com"               // password: TUNLER_SMTP_PASSWORD
-  }
+  "registration": { "mode": "allowlist", "allowlist": ["you"] },
+  "account_expiry": "720h"                     // delete accounts idle 30 days; "0s" = never
 }
 ```
-
-With `smtp` set, `tunler login` emails a six-digit code to the address and
-asks for it, so the master password alone can no longer log in as someone
-else. Every SMTP field can also come from the environment
-(`TUNLER_SMTP_HOST`, `TUNLER_SMTP_PORT`, `TUNLER_SMTP_USERNAME`,
-`TUNLER_SMTP_PASSWORD`, `TUNLER_SMTP_FROM`). Without SMTP the server warns at
-startup: anyone with the master password can then log in as any user.
 
 ### Without Docker
 
@@ -183,22 +175,22 @@ state:
 
 ```sh
 tunler connect 8000 --host=tunler.example.com --domain=my-app --secret=$TUNLER_SECRET
-tunler login ci@example.com --host=... --password=... --no-save   # prints the secret
-tunler list --json / tunler status --json                          # machine-readable
+tunler login ci --host=... --password=... --no-save   # prints the secret
+tunler list --json / tunler status --json              # machine-readable
 ```
 
-Env vars: `TUNLER_HOST`, `TUNLER_SECRET`, `TUNLER_PASSWORD`.
+Env vars: `TUNLER_HOST`, `TUNLER_SECRET`, `TUNLER_PASSWORD` (your account
+password), `TUNLER_MASTER_PASSWORD` (the server's, to create an account).
 
 ## Security & privacy
 
 - The server logs no traffic, only login and tunnel events.
-- One master password per server, required to log in. Optional allowlist to
-  restrict who can register. It is stored as a bcrypt hash; failed attempts,
-  at login and on gated downloads alike, share one escalating lockout.
-- With SMTP configured, each login is confirmed by a code emailed to the
-  address (10 minutes, 5 tries, 5 codes per address per hour), so users cannot
-  log in as each other. Without it, everyone with the master password is
-  trusted as every user.
+- Each account has its own password (bcrypt). The server's master password
+  is only needed to create an account (and for gated downloads), so it is no
+  way into anyone else's account. Optional allowlist to restrict who can
+  register. Every password has its own escalating lockout on failures.
+- Accounts idle for 30 days (configurable) are deleted with their
+  subdomains; live tunnels count as activity.
 - Logins get a random 256-bit secret; the server stores only its hash.
 - Subdomains are owned by the first user to claim them. Releasing one ends
   its live tunnel.
@@ -232,7 +224,7 @@ make build   # build ./bin/tunler and ./bin/tunler-server
 # start a local server, a dummy app on :9000, and a tunnel to it
 ./bin/tunler-server --domain localhost --password test --no-tls --listen :8080 &
 python3 -m http.server 9000 &
-./bin/tunler connect 9000 --host=localhost:8080 --domain=my-app --email=me@example.com --password=test --insecure &
+./bin/tunler connect 9000 --host=localhost:8080 --domain=my-app --user=me --password=my-password --master-password=test --insecure &
 
 # reach the tunnel through the server
 curl -H "Host: my-app.localhost" http://localhost:8080/

@@ -58,7 +58,7 @@ func (s *Server) handleInstall(w http.ResponseWriter, r *http.Request) {
 
 func unauthorizedDownload(w http.ResponseWriter) {
 	w.Header().Set("WWW-Authenticate", `Basic realm="tunler"`)
-	http.Error(w, "authentication required (set TUNLER_PASSWORD and use curl -u tunler:$TUNLER_PASSWORD)", http.StatusUnauthorized)
+	http.Error(w, "authentication required (set TUNLER_MASTER_PASSWORD and use curl -u tunler:$TUNLER_MASTER_PASSWORD)", http.StatusUnauthorized)
 }
 
 func isLoopback(host string) bool {
@@ -98,9 +98,10 @@ if [ ! -w "$DIR" ]; then
   mkdir -p "$DIR"
 fi
 
-# If the server requires a password for downloads, set TUNLER_PASSWORD and it
-# is passed through as HTTP basic auth (harmless when auth isn't required).
-PASS="${TUNLER_PASSWORD:-}"
+# If the server requires its master password for downloads, set
+# TUNLER_MASTER_PASSWORD and it is passed through as HTTP basic auth
+# (harmless when auth isn't required). TUNLER_PASSWORD is the old name.
+PASS="${TUNLER_MASTER_PASSWORD:-${TUNLER_PASSWORD:-}}"
 fetch() {
   if command -v curl >/dev/null 2>&1; then
     if [ -n "$PASS" ]; then curl -fsSL -u "tunler:$PASS" -o "$1" "$2"; else curl -fsSL -o "$1" "$2"; fi
@@ -151,6 +152,6 @@ case ":$PATH:" in
   *":$DIR:"*) ;;
   *) echo "note: $DIR is not in your PATH" ;;
 esac
-echo "get started:  tunler login <email>"
+echo "get started:  tunler login <username>"
 echo "then:         tunler 8000"
 `
