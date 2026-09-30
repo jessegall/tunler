@@ -79,8 +79,13 @@ func (s *State) AddSecret(email string) (string, error) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.data.Users[hashSecret(secret)] = email
-	return secret, s.save()
+	h := hashSecret(secret)
+	s.data.Users[h] = email
+	if err := s.save(); err != nil {
+		delete(s.data.Users, h) // keep memory in step with disk
+		return "", err
+	}
+	return secret, nil
 }
 
 // UserBySecret resolves a presented secret to the owning user's email.
@@ -98,8 +103,17 @@ func (s *State) UserBySecret(secret string) (string, bool) {
 func (s *State) RevokeSecret(secret string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	delete(s.data.Users, hashSecret(secret))
-	return s.save()
+	h := hashSecret(secret)
+	email, ok := s.data.Users[h]
+	if !ok {
+		return nil
+	}
+	delete(s.data.Users, h)
+	if err := s.save(); err != nil {
+		s.data.Users[h] = email
+		return err
+	}
+	return nil
 }
 
 // Owner returns the owner of domain, if claimed.
@@ -123,7 +137,11 @@ func (s *State) Claim(domain, email string) (newlyClaimed bool, err error) {
 		return false, nil
 	}
 	s.data.Domains[domain] = email
-	return true, s.save()
+	if err := s.save(); err != nil {
+		delete(s.data.Domains, domain)
+		return false, err
+	}
+	return true, nil
 }
 
 // Release unclaims a domain owned by email.
@@ -138,7 +156,11 @@ func (s *State) Release(domain, email string) error {
 		return ErrDomainTaken
 	}
 	delete(s.data.Domains, domain)
-	return s.save()
+	if err := s.save(); err != nil {
+		s.data.Domains[domain] = owner
+		return err
+	}
+	return nil
 }
 
 // Domains returns every claimed domain label, sorted.
@@ -175,9 +197,39 @@ func (s *State) save() error {
 	if err := os.MkdirAll(filepath.Dir(s.path), 0o700); err != nil {
 		return err
 	}
-	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+	return writeFileAtomic(s.path, raw, 0o600)
+}
+
+// writeFileAtomic replaces path with data so a crash leaves either the old
+// or the new file, never a truncated one: the data is synced before the
+// rename, and the rename is synced after it.
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	f, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, s.path)
+	tmp := f.Name()
+	_, err = f.Write(data)
+	if err == nil {
+		err = f.Sync()
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil {
+		err = os.Chmod(tmp, perm)
+	}
+	if err == nil {
+		err = os.Rename(tmp, path)
+	}
+	if err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if d, err := os.Open(dir); err == nil {
+		d.Sync() // best effort: not every platform can sync a directory
+		d.Close()
+	}
+	return nil
 }

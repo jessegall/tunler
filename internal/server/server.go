@@ -32,6 +32,10 @@ const (
 	readTimeout  = 90 * time.Second
 	dialTimeout  = 15 * time.Second
 	writeTimeout = 10 * time.Second
+
+	// maxBackoffShift caps the lockout's doubling so time.Minute<<n can never
+	// overflow into a negative (i.e. already expired) lock.
+	maxBackoffShift = 20
 )
 
 // Version is stamped at build time via -ldflags.
@@ -40,6 +44,11 @@ var Version = "dev"
 // loginFailDelay slows every failed login to blunt brute-forcing. It is a
 // variable so tests can disable the delay.
 var loginFailDelay = time.Second
+
+// probeTimeout is how long a live control connection has to answer a ping
+// before a reconnecting client of the same owner replaces it. A variable so
+// tests can shorten it.
+var probeTimeout = 5 * time.Second
 
 // Server routes public traffic to connected tunnel clients.
 type Server struct {
@@ -51,10 +60,17 @@ type Server struct {
 	tunnels map[string]*tunnel // active tunnels by domain label
 
 	// Login lockout. With Traefik TCP passthrough the visitor IP is not
-	// recoverable, so the backoff is global; see Config.Lockout.
+	// recoverable, so the backoff is global; see Config.Lockout. loginMu is
+	// held for the whole of each master-password check, so parallel guesses
+	// cannot all pass the lockout before the first failure arms it.
 	loginMu    sync.Mutex
 	loginFails int
 	loginLock  time.Time
+
+	syncMu sync.Mutex // serializes SyncTraefik
+
+	mailer mailer // sends login codes; nil when logins are not confirmed by email
+	codes  loginCodes
 
 	proxy *httputil.ReverseProxy
 }
@@ -65,6 +81,13 @@ type tunnel struct {
 	auth   string        // optional "user:pass" required from visitors
 	conn   net.Conn      // the control connection
 	sem    chan struct{} // concurrent-data-connection limiter; nil = unlimited
+	seen   chan struct{} // signalled on every control message; see responsive
+
+	// transport pools this tunnel's data connections. It is per tunnel so
+	// idle connections are closed with the tunnel and can never serve a
+	// later tunnel on the same domain.
+	transport *http.Transport
+	probeMu   sync.Mutex // one liveness probe at a time
 
 	writeMu sync.Mutex // serializes framed writes to conn/enc
 	enc     *json.Encoder
@@ -85,6 +108,13 @@ func New(cfg Config, state *State) *Server {
 		state:    state,
 		reserved: reserved,
 		tunnels:  map[string]*tunnel{},
+		codes: loginCodes{
+			pending: map[string]*pendingLogin{},
+			sent:    map[string][]time.Time{},
+		},
+	}
+	if cfg.SMTP.Enabled() {
+		s.mailer = smtpMailer{cfg.SMTP}
 	}
 	s.proxy = &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
@@ -96,12 +126,7 @@ func New(cfg Config, state *State) *Server {
 			pr.Out.Host = pr.In.Host
 			pr.SetXForwarded()
 		},
-		Transport: &http.Transport{
-			DialContext:           s.dialTunnel,
-			MaxIdleConnsPerHost:   4,
-			IdleConnTimeout:       60 * time.Second,
-			ResponseHeaderTimeout: time.Duration(cfg.Limits.ResponseHeaderTimeout),
-		},
+		Transport:     tunnelRoundTripper{s},
 		FlushInterval: -1, // flush immediately: keeps SSE/streaming responsive
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			http.Error(w, "tunler: "+err.Error(), http.StatusBadGateway)
@@ -111,6 +136,21 @@ func New(cfg Config, state *State) *Server {
 }
 
 type labelKey struct{}
+
+// tunnelRoundTripper sends each proxied request through the transport of the
+// tunnel currently holding the request's label.
+type tunnelRoundTripper struct{ s *Server }
+
+func (rt tunnelRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	label := req.URL.Hostname()
+	rt.s.mu.Lock()
+	t, ok := rt.s.tunnels[label]
+	rt.s.mu.Unlock()
+	if !ok {
+		return nil, fmt.Errorf("no active tunnel for %q", label)
+	}
+	return t.transport.RoundTrip(req)
+}
 
 // ServeHTTP is the single entry point for all traffic on 80/443.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -136,6 +176,8 @@ func (s *Server) serveControlPlane(w http.ResponseWriter, r *http.Request) {
 	switch r.URL.Path {
 	case protocol.LoginPath:
 		s.handleLogin(w, r)
+	case protocol.LoginVerifyPath:
+		s.handleLoginVerify(w, r)
 	case protocol.LogoutPath:
 		s.handleLogout(w, r)
 	case protocol.DomainsPath:
@@ -197,7 +239,9 @@ func (s *Server) serveTunnel(w http.ResponseWriter, r *http.Request, label strin
 
 // handleLogin exchanges the master password for a new user secret, creating
 // the user on first login. Each login mints an additional secret, so logging
-// in from a second machine doesn't invalidate the first.
+// in from a second machine doesn't invalidate the first. When SMTP is set up
+// the secret is only minted once the code emailed to the address comes back
+// through handleLoginVerify.
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		httpError(w, http.StatusMethodNotAllowed, "POST required")
@@ -209,20 +253,18 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if wait := s.lockoutRemaining(); wait > 0 {
+	ok, wait := s.checkMasterPassword(req.Password, r.RemoteAddr)
+	if wait > 0 {
 		w.Header().Set("Retry-After", fmt.Sprintf("%.0f", wait.Seconds()))
 		httpError(w, http.StatusTooManyRequests,
 			fmt.Sprintf("too many failed logins; retry in %s", wait.Round(time.Second)))
 		return
 	}
-
-	if subtle.ConstantTimeCompare([]byte(HashPassword(req.Password)), []byte(s.cfg.PasswordHash)) != 1 {
-		s.recordLoginFailure(r.RemoteAddr)
+	if !ok {
 		time.Sleep(loginFailDelay)
 		httpError(w, http.StatusUnauthorized, "invalid password")
 		return
 	}
-	s.resetLoginFailures()
 
 	if !ValidEmail(req.Email) {
 		httpError(w, http.StatusBadRequest, "invalid email address")
@@ -232,44 +274,97 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusForbidden, "email is not permitted to register on this server")
 		return
 	}
-	secret, err := s.state.AddSecret(req.Email)
+	if s.mailer != nil {
+		if !req.Verify {
+			httpError(w, http.StatusBadRequest, "this server confirms logins by email; update the client with `tunler update`")
+			return
+		}
+		id, err := s.codes.start(s.mailer, s.cfg.Domain, req.Email)
+		switch {
+		case errors.Is(err, errTooManyCodes):
+			httpError(w, http.StatusTooManyRequests, err.Error())
+			return
+		case err != nil:
+			log.Printf("login code for %s not sent: %v", req.Email, err)
+			httpError(w, http.StatusBadGateway, "could not send the login code")
+			return
+		}
+		log.Printf("login code sent: %s from %s", req.Email, r.RemoteAddr)
+		writeJSONStatus(w, http.StatusAccepted, protocol.LoginResponse{Pending: id})
+		return
+	}
+	s.issueSecret(w, r, req.Email)
+}
+
+// handleLoginVerify finishes an email-confirmed login: the pending ID and the
+// emailed code buy a user secret.
+func (s *Server) handleLoginVerify(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		httpError(w, http.StatusMethodNotAllowed, "POST required")
+		return
+	}
+	if s.mailer == nil {
+		httpError(w, http.StatusNotFound, "this server does not confirm logins by email")
+		return
+	}
+	var req protocol.LoginVerifyRequest
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil {
+		httpError(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	email, err := s.codes.finish(req.Pending, req.Code)
+	if err != nil {
+		time.Sleep(loginFailDelay)
+		httpError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+	s.issueSecret(w, r, email)
+}
+
+// issueSecret mints a secret for email and returns it.
+func (s *Server) issueSecret(w http.ResponseWriter, r *http.Request, email string) {
+	secret, err := s.state.AddSecret(email)
 	if err != nil {
 		httpError(w, http.StatusInternalServerError, "could not store user")
 		return
 	}
-	log.Printf("login: %s from %s", req.Email, r.RemoteAddr)
+	log.Printf("login: %s from %s", email, r.RemoteAddr)
 	writeJSON(w, protocol.LoginResponse{Secret: secret})
 }
 
-// lockoutRemaining returns how long logins are locked, or 0 if open.
-func (s *Server) lockoutRemaining() time.Duration {
-	if !s.cfg.Lockout.Enabled {
-		return 0
-	}
+// checkMasterPassword verifies one master-password attempt under the global
+// lockout, for logins and gated downloads alike. It returns how long the
+// lockout still runs when locked (the password is then not checked at all).
+// Checks are serialized under loginMu, so each failure arms the lock before
+// the next attempt is looked at.
+func (s *Server) checkMasterPassword(password, remoteAddr string) (ok bool, wait time.Duration) {
 	s.loginMu.Lock()
 	defer s.loginMu.Unlock()
-	return time.Until(s.loginLock)
+	if s.cfg.Lockout.Enabled {
+		if wait := time.Until(s.loginLock); wait > 0 {
+			return false, wait
+		}
+	}
+	if VerifyPassword(password, s.cfg.PasswordHash) {
+		s.loginFails = 0
+		return true, 0
+	}
+	s.recordLoginFailure(remoteAddr)
+	return false, 0
 }
 
-// recordLoginFailure escalates the global lockout after enough failures.
+// recordLoginFailure escalates the global lockout after enough failures. It
+// must be called with loginMu held.
 func (s *Server) recordLoginFailure(remoteAddr string) {
 	if !s.cfg.Lockout.Enabled {
 		return
 	}
-	s.loginMu.Lock()
-	defer s.loginMu.Unlock()
 	s.loginFails++
 	if over := s.loginFails - s.cfg.Lockout.Threshold; over >= 0 {
-		backoff := min(time.Minute<<over, time.Duration(s.cfg.Lockout.MaxBackoff))
+		backoff := min(time.Minute<<min(over, maxBackoffShift), time.Duration(s.cfg.Lockout.MaxBackoff))
 		s.loginLock = time.Now().Add(backoff)
 		log.Printf("login locked for %s after %d failures (last from %s)", backoff, s.loginFails, remoteAddr)
 	}
-}
-
-func (s *Server) resetLoginFailures() {
-	s.loginMu.Lock()
-	s.loginFails = 0
-	s.loginMu.Unlock()
 }
 
 // handleLogout revokes the presented secret.
@@ -319,8 +414,23 @@ func (s *Server) handleRelease(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	log.Printf("released domain %q by %s", req.Domain, email)
+	s.closeTunnel(req.Domain, "domain released")
 	s.syncTraefikLogged()
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// closeTunnel tells the client holding domain why its tunnel ends, so it
+// does not reconnect, and drops the tunnel.
+func (s *Server) closeTunnel(domain, reason string) {
+	s.mu.Lock()
+	t, ok := s.tunnels[domain]
+	s.mu.Unlock()
+	if !ok {
+		return
+	}
+	t.send(protocol.Message{Type: protocol.TypeClose, Reason: reason})
+	t.conn.Close()
+	s.removeTunnel(t)
 }
 
 func releaseStatus(err error) int {
@@ -355,13 +465,22 @@ func (s *Server) handleControl(w http.ResponseWriter, r *http.Request) {
 		s.syncTraefikLogged()
 	}
 
+	// The domain may still hold this owner's previous control connection,
+	// e.g. after the client's network dropped before the server noticed. A
+	// connection that no longer answers a ping is replaced rather than making
+	// the client wait out readTimeout.
 	s.mu.Lock()
-	if _, busy := s.tunnels[domain]; busy {
-		s.mu.Unlock()
-		httpError(w, http.StatusConflict, "domain already has an active tunnel")
-		return
-	}
+	old, busy := s.tunnels[domain]
 	s.mu.Unlock()
+	if busy {
+		if old.responsive(probeTimeout) {
+			httpError(w, http.StatusConflict, "domain already has an active tunnel")
+			return
+		}
+		log.Printf("replacing unresponsive tunnel for %s.%s", domain, s.cfg.Domain)
+		old.conn.Close()
+		s.removeTunnel(old)
+	}
 
 	conn, br, err := hijack(w)
 	if err != nil {
@@ -373,11 +492,20 @@ func (s *Server) handleControl(w http.ResponseWriter, r *http.Request) {
 		domain:  domain,
 		auth:    r.Header.Get(protocol.HeaderAuth),
 		conn:    conn,
+		seen:    make(chan struct{}, 1),
 		enc:     json.NewEncoder(conn),
 		pending: map[string]chan net.Conn{},
 	}
 	if n := s.cfg.Limits.MaxConnsPerTunnel; n > 0 {
 		t.sem = make(chan struct{}, n)
+	}
+	t.transport = &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return s.dialData(ctx, t)
+		},
+		MaxIdleConnsPerHost:   4,
+		IdleConnTimeout:       60 * time.Second,
+		ResponseHeaderTimeout: time.Duration(s.cfg.Limits.ResponseHeaderTimeout),
 	}
 
 	s.mu.Lock()
@@ -406,6 +534,10 @@ func (s *Server) runControl(t *tunnel, br *bufio.Reader) {
 		if err := dec.Decode(&msg); err != nil {
 			return
 		}
+		select {
+		case t.seen <- struct{}{}:
+		default:
+		}
 		if msg.Type == protocol.TypePing {
 			if err := t.send(protocol.Message{Type: protocol.TypePong}); err != nil {
 				return
@@ -428,6 +560,30 @@ func (s *Server) removeTunnel(t *tunnel) {
 		delete(t.pending, id)
 	}
 	t.mu.Unlock()
+	t.transport.CloseIdleConnections()
+}
+
+// responsive pings the client and reports whether it answers within timeout.
+// Any control message counts as an answer, so a client that keeps pinging on
+// its own is live too.
+func (t *tunnel) responsive(timeout time.Duration) bool {
+	t.probeMu.Lock()
+	defer t.probeMu.Unlock()
+	select {
+	case <-t.seen: // drop a signal from before the probe
+	default:
+	}
+	if err := t.send(protocol.Message{Type: protocol.TypePing}); err != nil {
+		return false
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-t.seen:
+		return true
+	case <-timer.C:
+		return false
+	}
 }
 
 func (t *tunnel) send(msg protocol.Message) error {
@@ -454,22 +610,10 @@ func (t *tunnel) acquire() (release func(), ok bool) {
 
 // --- data channel ---
 
-// dialTunnel is the ReverseProxy transport's dialer. addr is "<label>:80". It
-// asks the client (via the control channel) to dial back a data connection
-// and returns that connection, bounded by the per-tunnel limit and idle
-// timeout.
-func (s *Server) dialTunnel(ctx context.Context, _, addr string) (net.Conn, error) {
-	label, _, err := net.SplitHostPort(addr)
-	if err != nil {
-		label = addr
-	}
-	s.mu.Lock()
-	t, ok := s.tunnels[label]
-	s.mu.Unlock()
-	if !ok {
-		return nil, fmt.Errorf("no active tunnel for %q", label)
-	}
-
+// dialData is the dialer of a tunnel's transport. It asks the client (via the
+// control channel) to dial back a data connection and returns that
+// connection, bounded by the per-tunnel limit and idle timeout.
+func (s *Server) dialData(ctx context.Context, t *tunnel) (net.Conn, error) {
 	release, ok := t.acquire()
 	if !ok {
 		return nil, errors.New("tunnel connection limit reached")
@@ -640,13 +784,30 @@ func (s *Server) AllowHost(_ context.Context, host string) error {
 	return fmt.Errorf("host %q not allowed", host)
 }
 
-// downloadAuthorized reports whether a client-download request may proceed.
-func (s *Server) downloadAuthorized(r *http.Request) bool {
+// downloadAuthorized reports whether a client-download request may proceed,
+// answering the request itself when it may not. The password check shares
+// the login lockout, so downloads are no side door for guessing it.
+func (s *Server) downloadAuthorized(w http.ResponseWriter, r *http.Request) bool {
 	if !s.cfg.Downloads.RequireAuth {
 		return true
 	}
-	_, pass, ok := r.BasicAuth()
-	return ok && subtle.ConstantTimeCompare([]byte(HashPassword(pass)), []byte(s.cfg.PasswordHash)) == 1
+	_, pass, has := r.BasicAuth()
+	if !has {
+		unauthorizedDownload(w)
+		return false
+	}
+	ok, wait := s.checkMasterPassword(pass, r.RemoteAddr)
+	if wait > 0 {
+		w.Header().Set("Retry-After", fmt.Sprintf("%.0f", wait.Seconds()))
+		http.Error(w, fmt.Sprintf("too many failed attempts; retry in %s", wait.Round(time.Second)), http.StatusTooManyRequests)
+		return false
+	}
+	if !ok {
+		time.Sleep(loginFailDelay)
+		unauthorizedDownload(w)
+		return false
+	}
+	return true
 }
 
 func (s *Server) syncTraefikLogged() {
@@ -687,7 +848,12 @@ type bufferedConn struct {
 func (c *bufferedConn) Read(p []byte) (int, error) { return c.r.Read(p) }
 
 func writeJSON(w http.ResponseWriter, v any) {
+	writeJSONStatus(w, http.StatusOK, v)
+}
+
+func writeJSONStatus(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
 	json.NewEncoder(w).Encode(v)
 }
 

@@ -19,6 +19,11 @@ type Store struct {
 type HostCreds struct {
 	Email  string `json:"email"`
 	Secret string `json:"secret"`
+
+	// Ephemeral remembers the random domains used for tunnels started
+	// without --domain, so they are reused instead of minting (and making
+	// the server fetch a certificate for) a new name every time.
+	Ephemeral []string `json:"ephemeral,omitempty"`
 }
 
 // configDir returns the tunler config directory (~/.config/tunler et al.).

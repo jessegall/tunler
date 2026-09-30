@@ -15,7 +15,7 @@ func testServer(t *testing.T) *Server {
 	t.Helper()
 	cfg := DefaultConfig()
 	cfg.Domain = "tunler.example.com"
-	cfg.PasswordHash = HashPassword("correct-password")
+	cfg.PasswordHash = mustHash(t, "correct-password")
 	return New(cfg, newTestState(t))
 }
 
@@ -123,7 +123,7 @@ func TestSubdomainWithoutTunnel(t *testing.T) {
 func TestLockoutDisabled(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.Domain = "tunler.example.com"
-	cfg.PasswordHash = HashPassword("correct-password")
+	cfg.PasswordHash = mustHash(t, "correct-password")
 	cfg.Lockout.Enabled = false
 	srv := New(cfg, newTestState(t))
 
@@ -139,7 +139,7 @@ func TestLockoutDisabled(t *testing.T) {
 func TestRegistrationAllowlistLogin(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.Domain = "tunler.example.com"
-	cfg.PasswordHash = HashPassword("correct-password")
+	cfg.PasswordHash = mustHash(t, "correct-password")
 	cfg.Registration = Registration{Mode: "allowlist", Allowlist: []string{"ok@x.nl"}}
 	srv := New(cfg, newTestState(t))
 

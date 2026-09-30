@@ -18,6 +18,10 @@ const (
 	// user with the server master password in exchange for a user secret.
 	LoginPath = "/_tunler/login"
 
+	// LoginVerifyPath (POST) finishes a login the server confirms by email:
+	// it trades the pending ID and the emailed code for the user secret.
+	LoginVerifyPath = "/_tunler/login/verify"
+
 	// LogoutPath (POST) revokes the presented secret server-side.
 	LogoutPath = "/_tunler/logout"
 
@@ -44,24 +48,41 @@ const (
 	TypeOpen = "open" // server -> client: dial a data connection for ID
 	TypePing = "ping" // either direction: keepalive
 	TypePong = "pong" // reply to ping
+
+	// TypeClose (server -> client) ends the tunnel for good, e.g. because its
+	// domain was released; the client must not reconnect.
+	TypeClose = "close"
 )
 
 // Message is a control-channel frame.
 type Message struct {
-	Type string `json:"type"`
-	ID   string `json:"id,omitempty"`
+	Type   string `json:"type"`
+	ID     string `json:"id,omitempty"`
+	Reason string `json:"reason,omitempty"` // TypeClose only
 }
 
 // LoginRequest creates (or re-authenticates) a user with the master password.
+// Verify declares that the client can finish an email-confirmed login; a
+// server that confirms logins by email refuses clients that cannot.
 type LoginRequest struct {
 	Email    string `json:"email"`
 	Password string `json:"password"`
+	Verify   bool   `json:"verify,omitempty"`
 }
 
 // LoginResponse returns a freshly minted user secret. Every tunnel/domain
-// is scoped to the user this secret belongs to.
+// is scoped to the user this secret belongs to. When the server confirms
+// logins by email it answers 202 with Pending set instead, and the secret
+// comes from LoginVerifyPath once the emailed code is presented.
 type LoginResponse struct {
-	Secret string `json:"secret"`
+	Secret  string `json:"secret,omitempty"`
+	Pending string `json:"pending,omitempty"`
+}
+
+// LoginVerifyRequest presents the code emailed for a pending login.
+type LoginVerifyRequest struct {
+	Pending string `json:"pending"`
+	Code    string `json:"code"`
 }
 
 // DomainsResponse lists the domains owned by the authenticated user.

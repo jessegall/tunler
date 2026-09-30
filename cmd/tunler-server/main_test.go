@@ -31,7 +31,7 @@ func TestLoadConfigPrecedence(t *testing.T) {
 		t.Errorf("email = %q, want file@x.nl", cfg.Email)
 	}
 	// password from env is hashed.
-	if cfg.PasswordHash != server.HashPassword("envpw") {
+	if !server.VerifyPassword("envpw", cfg.PasswordHash) {
 		t.Error("env password not hashed into PasswordHash")
 	}
 }

@@ -49,11 +49,33 @@ func cmdUpdate(args []string) error {
 		return fmt.Errorf("cannot locate own executable: %w", err)
 	}
 
-	published, err := fetchString(base + ".sha256")
+	// A server that gates downloads wants the master password as basic
+	// auth, the same as the install script sends.
+	get := func(c *http.Client, url string) (*http.Response, error) {
+		req, err := http.NewRequest(http.MethodGet, url, nil)
+		if err != nil {
+			return nil, err
+		}
+		if o.password != "" {
+			req.SetBasicAuth("tunler", o.password)
+		}
+		resp, err := c.Do(req)
+		if err == nil && resp.StatusCode == http.StatusUnauthorized {
+			resp.Body.Close()
+			return nil, errors.New("the server requires the master password for downloads: set TUNLER_PASSWORD or pass --password")
+		}
+		return resp, err
+	}
+
+	sum, err := fetchString(get, base+".sha256")
 	if err != nil {
 		return fmt.Errorf("cannot fetch checksum from %s: %w", o.host, err)
 	}
-	published = strings.Fields(published)[0]
+	fields := strings.Fields(sum)
+	if len(fields) == 0 {
+		return fmt.Errorf("empty checksum from %s", o.host)
+	}
+	published := fields[0]
 	current, err := fileSHA256(self)
 	if err != nil {
 		return fmt.Errorf("cannot hash %s: %w", self, err)
@@ -64,7 +86,7 @@ func cmdUpdate(args []string) error {
 	}
 
 	fmt.Fprintf(os.Stderr, "downloading %s\n", base)
-	tmp, err := download(base, filepath.Dir(self))
+	tmp, err := download(get, base, filepath.Dir(self))
 	if err != nil {
 		return fmt.Errorf("download failed: %w", err)
 	}
@@ -102,9 +124,11 @@ func cmdUpdate(args []string) error {
 	return nil
 }
 
-func fetchString(url string) (string, error) {
-	c := &http.Client{Timeout: 30 * time.Second}
-	resp, err := c.Get(url)
+// getter performs a GET with c, adding whatever auth the server needs.
+type getter func(c *http.Client, url string) (*http.Response, error)
+
+func fetchString(get getter, url string) (string, error) {
+	resp, err := get(&http.Client{Timeout: 30 * time.Second}, url)
 	if err != nil {
 		return "", err
 	}
@@ -118,9 +142,8 @@ func fetchString(url string) (string, error) {
 
 // download fetches url into a temp file in dir (same filesystem as the
 // binary, so the final rename is atomic).
-func download(url, dir string) (string, error) {
-	c := &http.Client{Timeout: 5 * time.Minute}
-	resp, err := c.Get(url)
+func download(get getter, url, dir string) (string, error) {
+	resp, err := get(&http.Client{Timeout: 5 * time.Minute}, url)
 	if err != nil {
 		return "", err
 	}

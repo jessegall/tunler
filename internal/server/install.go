@@ -15,8 +15,7 @@ var binaryName = regexp.MustCompile(`^tunler(-server)?-[a-z0-9]+-[a-z0-9]+(\.exe
 
 // handleDownload serves a cross-compiled client binary from the bin dir.
 func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request, name string) {
-	if !s.downloadAuthorized(r) {
-		unauthorizedDownload(w)
+	if !s.downloadAuthorized(w, r) {
 		return
 	}
 	if s.cfg.BinDir == "" {
@@ -39,8 +38,7 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request, name str
 // handleInstall serves a self-contained installer script that detects the
 // machine's OS/architecture and downloads the matching client binary.
 func (s *Server) handleInstall(w http.ResponseWriter, r *http.Request) {
-	if !s.downloadAuthorized(r) {
-		unauthorizedDownload(w)
+	if !s.downloadAuthorized(w, r) {
 		return
 	}
 	scheme := "https"

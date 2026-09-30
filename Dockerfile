@@ -24,6 +24,8 @@ RUN set -eu; \
 FROM alpine:3.22
 RUN apk add --no-cache ca-certificates
 COPY --from=build /out/tunler-server /usr/local/bin/tunler-server
-COPY --from=build /out/bin /var/lib/tunler/bin
+# Client binaries live outside the data volume: Docker fills a named volume
+# from the image only once, so binaries inside it would never be upgraded.
+COPY --from=build /out/bin /usr/local/share/tunler/bin
 VOLUME /var/lib/tunler
-ENTRYPOINT ["tunler-server", "--data", "/var/lib/tunler"]
+ENTRYPOINT ["tunler-server", "--data", "/var/lib/tunler", "--bin", "/usr/local/share/tunler/bin"]

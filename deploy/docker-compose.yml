@@ -4,6 +4,11 @@
 #   TUNLER_DOMAIN=tunler.example.com
 #   TUNLER_EMAIL=you@example.com
 #   TUNLER_PASSWORD=<master password>
+#   # optional, confirms every login by email (recommended):
+#   TUNLER_SMTP_HOST=smtp.example.com
+#   TUNLER_SMTP_USERNAME=tunler@example.com
+#   TUNLER_SMTP_PASSWORD=<smtp password>
+#   TUNLER_SMTP_FROM=tunler@example.com
 #
 # The image binds ports 80/443 and obtains Let's Encrypt certificates on
 # demand. If another reverse proxy already owns 80/443, drop the `ports`
@@ -20,6 +25,11 @@ services:
       - "--email=${TUNLER_EMAIL:-}"
     environment:
       - TUNLER_PASSWORD=${TUNLER_PASSWORD:?set TUNLER_PASSWORD in .env}
+      - TUNLER_SMTP_HOST=${TUNLER_SMTP_HOST:-}
+      - TUNLER_SMTP_PORT=${TUNLER_SMTP_PORT:-}
+      - TUNLER_SMTP_USERNAME=${TUNLER_SMTP_USERNAME:-}
+      - TUNLER_SMTP_PASSWORD=${TUNLER_SMTP_PASSWORD:-}
+      - TUNLER_SMTP_FROM=${TUNLER_SMTP_FROM:-}
     ports:
       - "80:80"
       - "443:443"

@@ -14,7 +14,7 @@ func TestSyncTraefik(t *testing.T) {
 
 	cfg := DefaultConfig()
 	cfg.Domain = "tunler.example.com"
-	cfg.PasswordHash = HashPassword("pw")
+	cfg.PasswordHash = mustHash(t, "pw")
 	cfg.TraefikFile = filepath.Join(t.TempDir(), "tunler.yml")
 	srv := New(cfg, s)
 

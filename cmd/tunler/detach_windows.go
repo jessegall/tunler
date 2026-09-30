@@ -25,6 +25,12 @@ func alive(pid int) bool {
 	return true
 }
 
+// lockFile and lockHeld have no Windows implementation: pidfiles there are
+// judged by their PID alone.
+func lockFile(string) func() { return func() {} }
+
+func lockHeld(string) (held, known bool) { return false, false }
+
 func terminate(p *os.Process) error {
 	return p.Kill()
 }

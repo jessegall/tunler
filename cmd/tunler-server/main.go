@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	"golang.org/x/crypto/acme/autocert"
@@ -87,6 +88,9 @@ func loadConfig(args []string, getenv func(string) string) (server.Config, runOp
 	if v := getenv("TUNLER_EMAIL"); v != "" {
 		cfg.Email = v
 	}
+	if err := overlaySMTP(&cfg.SMTP, getenv); err != nil {
+		return server.Config{}, runOptions{}, err
+	}
 	plainPassword := getenv("TUNLER_PASSWORD")
 
 	// explicitly-set flags overlay env
@@ -118,10 +122,35 @@ func loadConfig(args []string, getenv func(string) string) (server.Config, runOp
 	}
 	// A plaintext password from flag/env is hashed and wins over a file hash.
 	if plainPassword != "" {
-		cfg.PasswordHash = server.HashPassword(plainPassword)
+		if cfg.PasswordHash, err = server.HashPassword(plainPassword); err != nil {
+			return server.Config{}, runOptions{}, fmt.Errorf("hashing password: %w", err)
+		}
 	}
 
 	return cfg, runOptions{httpAddr: *httpAddr, tlsAddr: *tlsAddr, listen: *listen, noTLS: *noTLS}, nil
+}
+
+// overlaySMTP applies the TUNLER_SMTP_* environment variables, so the mail
+// password can live in the environment rather than the config file.
+func overlaySMTP(m *server.SMTP, getenv func(string) string) error {
+	for name, dst := range map[string]*string{
+		"TUNLER_SMTP_HOST":     &m.Host,
+		"TUNLER_SMTP_USERNAME": &m.Username,
+		"TUNLER_SMTP_PASSWORD": &m.Password,
+		"TUNLER_SMTP_FROM":     &m.From,
+	} {
+		if v := getenv(name); v != "" {
+			*dst = v
+		}
+	}
+	if v := getenv("TUNLER_SMTP_PORT"); v != "" {
+		port, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("TUNLER_SMTP_PORT: %w", err)
+		}
+		m.Port = port
+	}
+	return nil
 }
 
 func serve(cfg server.Config, run runOptions) error {
@@ -130,6 +159,13 @@ func serve(cfg server.Config, run runOptions) error {
 	}
 	if cfg.PasswordHash == "" {
 		return errors.New("a master password is required: pass --password, set TUNLER_PASSWORD, or set password_hash in the config file")
+	}
+
+	if cfg.SMTP.Enabled() && cfg.SMTP.From == "" {
+		return errors.New(`smtp is configured without a sender: set "smtp.from" or TUNLER_SMTP_FROM`)
+	}
+	if !cfg.SMTP.Enabled() {
+		log.Printf("warning: no SMTP configured, so logins are not confirmed by email and anyone with the master password can log in as any user")
 	}
 
 	state, err := server.LoadState(filepath.Join(cfg.DataDir, "state.json"))

@@ -12,6 +12,7 @@
 package main
 
 import (
+	"bufio"
 	"crypto/rand"
 	"encoding/json"
 	"errors"
@@ -19,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
@@ -204,13 +206,15 @@ func (o *opts) creds(needSecret bool) (client.Config, client.Store, error) {
 				return cfg, store, err
 			}
 		}
-		secret, err := client.Login(cfg, o.email, pw)
+		secret, err := client.Login(cfg, o.email, pw, func() (string, error) { return promptCode(o.email) })
 		if err != nil {
 			return cfg, store, fmt.Errorf("login failed: %w", err)
 		}
 		cfg.Secret = secret
 		if !o.noSave {
-			store.Hosts[o.host] = client.HostCreds{Email: o.email, Secret: secret}
+			saved := store.Hosts[o.host]
+			saved.Email, saved.Secret = o.email, secret
+			store.Hosts[o.host] = saved
 			if store.DefaultHost == "" {
 				store.DefaultHost = o.host
 			}
@@ -236,16 +240,16 @@ func cmdConnect(args []string) error {
 	if len(positional) != 1 {
 		return usageErr("usage: tunler connect <port|host:port> [--domain=<name>]")
 	}
-	if o.domain == "" {
-		// No domain requested: use a random ephemeral one, released on exit.
-		if o.domain, err = randomDomain(); err != nil {
-			return err
-		}
-		o.ephemeral = true
-	}
 	cfg, store, err := o.creds(true)
 	if err != nil {
 		return err
+	}
+	if o.domain == "" {
+		// No domain requested: use a random ephemeral one, released on exit.
+		if o.domain, err = pickEphemeral(&store, cfg.Host, !o.noSave); err != nil {
+			return err
+		}
+		o.ephemeral = true
 	}
 	cfg.Target = normalizeTarget(positional[0])
 	cfg.Domain = o.domain
@@ -268,7 +272,9 @@ func cmdConnect(args []string) error {
 		Started: time.Now(),
 	}
 	writeInfo(info)
+	unlock := holdTunnelLock(cfg.Host, cfg.Domain)
 	cleanup := func() {
+		unlock()
 		removeInfo(cfg.Host, cfg.Domain)
 		if o.ephemeral {
 			client.Release(cfg, cfg.Domain)
@@ -276,9 +282,10 @@ func cmdConnect(args []string) error {
 	}
 	// A background child marks its pidfile ready once up, so its parent knows
 	// startup succeeded without scraping log output.
-	var onUp func()
-	if o.logFile != "" {
-		onUp = func() {
+	everUp := false
+	onUp := func() {
+		everUp = true
+		if o.logFile != "" {
 			info.Ready = true
 			writeInfo(info)
 		}
@@ -305,14 +312,40 @@ func cmdConnect(args []string) error {
 	}
 
 	backoff := time.Second
+	repicks := 0
 	for {
 		start := time.Now()
 		err := client.Run(cfg, ins, onUp)
 
 		var authErr *client.AuthError
-		if errors.As(err, &authErr) {
+		taken := errors.As(err, &authErr) && authErr.Status == http.StatusForbidden
+		// A remembered random name may since belong to another user, or be
+		// live on another of this user's machines: move to a fresh name, but
+		// only before the tunnel was ever up, so a working URL never changes.
+		if o.ephemeral && !everUp && o.logFile == "" && repicks < 5 && (taken || errors.Is(err, client.ErrBusy)) {
+			repicks++
+			if taken {
+				forgetEphemeral(&store, cfg.Host, cfg.Domain, !o.noSave)
+			}
+			next, perr := newEphemeral(&store, cfg.Host, !o.noSave)
+			if perr != nil {
+				return perr
+			}
+			unlock()
+			removeInfo(cfg.Host, cfg.Domain)
+			cfg.Domain = next
+			info.Domain, info.URL = next, cfg.URL()
+			writeInfo(info)
+			unlock = holdTunnelLock(cfg.Host, cfg.Domain)
+			log.Printf("%v; using ephemeral domain %q instead", err, next)
+			continue
+		}
+		if authErr != nil {
 			cleanup()
-			return fmt.Errorf("rejected by server: %v\n(hint: `tunler login <email> --host=%s` to refresh credentials)", authErr, cfg.Host)
+			if authErr.Status == http.StatusUnauthorized {
+				return fmt.Errorf("rejected by server: %v\n(hint: `tunler login <email> --host=%s` to refresh credentials)", authErr, cfg.Host)
+			}
+			return fmt.Errorf("rejected by server: %v", authErr)
 		}
 
 		if time.Since(start) > time.Minute {
@@ -323,6 +356,64 @@ func cmdConnect(args []string) error {
 		if backoff < 30*time.Second {
 			backoff *= 2
 		}
+	}
+}
+
+// maxEphemeral bounds how many random domains are remembered per server.
+const maxEphemeral = 8
+
+// pickEphemeral returns a domain for a tunnel started without --domain. Every
+// new name makes the server fetch a new TLS certificate, and Let's Encrypt
+// allows only 50 a week per registered domain, so names are remembered per
+// server and reused once no tunnel on this machine holds them.
+func pickEphemeral(store *client.Store, host string, save bool) (string, error) {
+	inUse := map[string]bool{}
+	for _, t := range readTunnels() {
+		if t.Host == host {
+			inUse[t.Domain] = true
+		}
+	}
+	for _, d := range store.Hosts[host].Ephemeral {
+		if !inUse[d] {
+			return d, nil
+		}
+	}
+	return newEphemeral(store, host, save)
+}
+
+// newEphemeral mints a random domain and remembers it for host.
+func newEphemeral(store *client.Store, host string, save bool) (string, error) {
+	d, err := randomDomain()
+	if err != nil {
+		return "", err
+	}
+	creds := store.Hosts[host]
+	creds.Ephemeral = append(creds.Ephemeral, d)
+	if n := len(creds.Ephemeral); n > maxEphemeral {
+		creds.Ephemeral = creds.Ephemeral[n-maxEphemeral:]
+	}
+	store.Hosts[host] = creds
+	if save {
+		if err := store.Save(); err != nil {
+			log.Printf("warning: could not remember ephemeral domain: %v", err)
+		}
+	}
+	return d, nil
+}
+
+// forgetEphemeral drops a remembered domain that another user now owns.
+func forgetEphemeral(store *client.Store, host, domain string, save bool) {
+	creds := store.Hosts[host]
+	kept := creds.Ephemeral[:0]
+	for _, d := range creds.Ephemeral {
+		if d != domain {
+			kept = append(kept, d)
+		}
+	}
+	creds.Ephemeral = kept
+	store.Hosts[host] = creds
+	if save {
+		store.Save()
 	}
 }
 
@@ -415,7 +506,7 @@ func cmdLogin(args []string) error {
 		}
 	}
 	cfg := client.Config{Host: o.host, Insecure: o.insecure}
-	secret, err := client.Login(cfg, o.email, pw)
+	secret, err := client.Login(cfg, o.email, pw, func() (string, error) { return promptCode(o.email) })
 	if err != nil {
 		return fmt.Errorf("login failed: %w", err)
 	}
@@ -426,7 +517,9 @@ func cmdLogin(args []string) error {
 		return nil
 	}
 	store := client.LoadStore()
-	store.Hosts[o.host] = client.HostCreds{Email: o.email, Secret: secret}
+	saved := store.Hosts[o.host]
+	saved.Email, saved.Secret = o.email, secret
+	store.Hosts[o.host] = saved
 	store.DefaultHost = o.host
 	if err := store.Save(); err != nil {
 		return fmt.Errorf("could not save credentials: %w", err)
@@ -564,6 +657,17 @@ func promptPassword(host string) (string, error) {
 	}
 	fmt.Fprintln(os.Stderr)
 	return string(pw), nil
+}
+
+// promptCode asks for the login code the server emailed. It reads one line
+// from stdin, so a script can pipe the code in too.
+func promptCode(email string) (string, error) {
+	fmt.Fprintf(os.Stderr, "A login code was sent to %s. Code: ", email)
+	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+	if err != nil && line == "" {
+		return "", fmt.Errorf("cannot read login code: %w", err)
+	}
+	return strings.TrimSpace(line), nil
 }
 
 // isTarget reports whether s looks like a connect target ("8000",

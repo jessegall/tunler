@@ -5,6 +5,7 @@ import (
 	"bytes"
 	_ "embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -19,7 +20,72 @@ import (
 const (
 	maxExchanges = 200      // ring buffer size
 	maxBodyKeep  = 64 << 10 // bytes of each body kept for the inspector
+	maxTapBuffer = 1 << 20  // bytes a tap holds for a lagging parser before giving up
 )
+
+// errTapOverflow ends inspection of a connection whose parser fell too far
+// behind; the relay itself carries on.
+var errTapOverflow = errors.New("inspector fell behind")
+
+// tap receives a copy of one direction of a relayed connection. Unlike an
+// io.Pipe, Write never blocks: the bytes are buffered for the parser, and
+// if the parser falls maxTapBuffer behind (it can wait on the other
+// direction, e.g. for a request body while the app already answers) the tap
+// drops inspection instead of stalling traffic.
+type tap struct {
+	mu      sync.Mutex
+	cond    *sync.Cond
+	buf     bytes.Buffer
+	closed  bool // writer is done: the reader gets EOF once drained
+	dropped bool // overflowed: the reader gets errTapOverflow
+}
+
+func newTap() *tap {
+	t := &tap{}
+	t.cond = sync.NewCond(&t.mu)
+	return t
+}
+
+func (t *tap) Write(p []byte) (int, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	switch {
+	case t.closed || t.dropped:
+	case t.buf.Len()+len(p) > maxTapBuffer:
+		t.dropped = true
+		t.buf.Reset()
+		t.cond.Broadcast()
+	default:
+		t.buf.Write(p)
+		t.cond.Broadcast()
+	}
+	return len(p), nil // the relay's copy never fails because of the tap
+}
+
+func (t *tap) Read(p []byte) (int, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for t.buf.Len() == 0 && !t.closed && !t.dropped {
+		t.cond.Wait()
+	}
+	switch {
+	case t.dropped:
+		return 0, errTapOverflow
+	case t.buf.Len() > 0:
+		return t.buf.Read(p)
+	default:
+		return 0, io.EOF
+	}
+}
+
+// Close marks the end of the relayed stream.
+func (t *tap) Close() error {
+	t.mu.Lock()
+	t.closed = true
+	t.cond.Broadcast()
+	t.mu.Unlock()
+	return nil
+}
 
 // Exchange is one observed HTTP request/response pair flowing through the
 // tunnel. Parsing is purely observational: the byte relay never depends on
@@ -82,8 +148,8 @@ func (ins *Inspector) byID(id int) *Exchange {
 
 // observe parses the two tee'd byte streams of one tunnel connection.
 // reqR carries visitor->local bytes (requests), respR local->visitor
-// (responses). Both readers MUST be drained or the relay stalls, so every
-// exit path falls through to io.Copy(io.Discard, ...).
+// (responses). Every exit path drains both readers to the end, so a tap
+// stops buffering once the parser has given up.
 func (ins *Inspector) observe(reqR, respR io.Reader) {
 	queue := make(chan *Exchange, 64)
 
@@ -115,7 +181,7 @@ func (ins *Inspector) observe(reqR, respR io.Reader) {
 	defer drainExchanges(queue) // keep the request parser from blocking on a full queue
 	br := bufio.NewReader(respR)
 	for e := range queue {
-		resp, err := http.ReadResponse(br, &http.Request{Method: e.Method})
+		resp, err := readFinalResponse(br, e.Method)
 		if err != nil {
 			return
 		}
@@ -130,6 +196,18 @@ func (ins *Inspector) observe(reqR, respR io.Reader) {
 			byteCount(e.RespSize))
 		if err != nil || resp.StatusCode == http.StatusSwitchingProtocols {
 			return
+		}
+	}
+}
+
+// readFinalResponse reads the response that answers a request, skipping
+// interim 1xx responses such as 100 Continue (but not 101, which ends HTTP
+// on the connection).
+func readFinalResponse(br *bufio.Reader, method string) (*http.Response, error) {
+	for {
+		resp, err := http.ReadResponse(br, &http.Request{Method: method})
+		if err != nil || resp.StatusCode >= 200 || resp.StatusCode == http.StatusSwitchingProtocols {
+			return resp, err
 		}
 	}
 }
@@ -248,8 +326,26 @@ func (ins *Inspector) Serve(port int) (string, error) {
 		json.NewEncoder(w).Encode(out)
 	})
 
-	go http.Serve(ln, mux)
+	go http.Serve(ln, localOnly(mux))
 	return "http://" + ln.Addr().String(), nil
+}
+
+// localOnly refuses requests whose Host is not a loopback name. The UI shows
+// captured headers and bodies, and a web page could otherwise read them by
+// rebinding its own hostname to 127.0.0.1 (DNS rebinding).
+func localOnly(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		host := r.Host
+		if hh, _, err := net.SplitHostPort(host); err == nil {
+			host = hh
+		}
+		switch host {
+		case "127.0.0.1", "localhost", "::1":
+			h.ServeHTTP(w, r)
+		default:
+			http.Error(w, "forbidden host", http.StatusForbidden)
+		}
+	})
 }
 
 //go:embed inspector.html

@@ -3,6 +3,7 @@ package server
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -72,11 +73,29 @@ func TestLoadConfigMissingPath(t *testing.T) {
 }
 
 func TestHashPassword(t *testing.T) {
-	if h := HashPassword("hunter2"); len(h) != 64 {
-		t.Fatalf("hash length = %d, want 64", len(h))
+	h := mustHash(t, "hunter2")
+	if !VerifyPassword("hunter2", h) {
+		t.Fatal("password does not verify against its own hash")
 	}
-	if HashPassword("a") == HashPassword("b") {
-		t.Fatal("distinct passwords hash equal")
+	if VerifyPassword("hunter3", h) {
+		t.Fatal("wrong password verified")
+	}
+	if h == mustHash(t, "hunter2") {
+		t.Fatal("hash is not salted")
+	}
+	long := strings.Repeat("x", 100) // past bcrypt's 72-byte input limit
+	if lh := mustHash(t, long); VerifyPassword(long[:72], lh) {
+		t.Fatal("long password truncated")
+	}
+}
+
+func TestVerifyLegacyPasswordHash(t *testing.T) {
+	legacy := "f52fbd32b2b3b86ff88ef6c490628285f482af15ddcb29541f94bcf526a3f6c7" // hex sha256("hunter2")
+	if !VerifyPassword("hunter2", legacy) {
+		t.Fatal("legacy sha256 hash no longer verifies")
+	}
+	if VerifyPassword("hunter3", legacy) {
+		t.Fatal("wrong password verified against legacy hash")
 	}
 }
 

@@ -2,11 +2,15 @@ package server
 
 import (
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"time"
+
+	"golang.org/x/crypto/bcrypt"
 )
 
 // Config is the full server configuration. The command layer assembles it
@@ -15,7 +19,7 @@ import (
 type Config struct {
 	Domain       string       `json:"domain"`
 	Email        string       `json:"email"`         // Let's Encrypt contact (optional)
-	PasswordHash string       `json:"password_hash"` // hex(sha256(master password))
+	PasswordHash string       `json:"password_hash"` // bcrypt; a legacy hex(sha256) still verifies
 	DataDir      string       `json:"data_dir"`
 	BinDir       string       `json:"bin_dir"`      // client binaries served at /install and /dl/
 	TraefikFile  string       `json:"traefik_file"` // dynamic-config file to regenerate (optional)
@@ -24,7 +28,23 @@ type Config struct {
 	Limits       Limits       `json:"limits"`
 	Lockout      Lockout      `json:"lockout"`
 	Registration Registration `json:"registration"`
+	SMTP         SMTP         `json:"smtp"`
 }
+
+// SMTP configures the mail server that sends login codes. With a Host set,
+// every login is confirmed by a code emailed to the address, so the master
+// password alone cannot log in as someone else. Without it, anyone with the
+// master password can log in as any email.
+type SMTP struct {
+	Host     string `json:"host"`
+	Port     int    `json:"port"` // 587 (STARTTLS) by default; 465 means implicit TLS
+	Username string `json:"username"`
+	Password string `json:"password"`
+	From     string `json:"from"` // sender address
+}
+
+// Enabled reports whether logins are confirmed by email.
+func (m SMTP) Enabled() bool { return m.Host != "" }
 
 // Downloads controls the /install and /dl/ endpoints.
 type Downloads struct {
@@ -88,10 +108,33 @@ func LoadConfig(path string) (Config, error) {
 	return cfg, nil
 }
 
-// HashPassword returns the hex SHA-256 of a master password, the form kept
-// in PasswordHash and compared at login, so plaintext need not be stored.
-func HashPassword(password string) string {
-	sum := sha256.Sum256([]byte(password))
+// HashPassword returns the bcrypt hash of a master password, the form kept in
+// PasswordHash, so plaintext need not be stored and a leaked hash is slow to
+// crack. The password is pre-hashed to hex SHA-256 so bcrypt's 72-byte input
+// limit never truncates or rejects a long password.
+func HashPassword(password string) (string, error) {
+	hash, err := bcrypt.GenerateFromPassword([]byte(sha256Hex(password)), bcryptCost)
+	if err != nil {
+		return "", err
+	}
+	return string(hash), nil
+}
+
+// bcryptCost is a variable so tests can use the cheapest cost.
+var bcryptCost = bcrypt.DefaultCost
+
+// VerifyPassword reports whether password matches hash. It accepts both the
+// bcrypt form HashPassword produces and the legacy unsalted hex SHA-256 form,
+// so configs written by older versions keep working.
+func VerifyPassword(password, hash string) bool {
+	if strings.HasPrefix(hash, "$2") {
+		return bcrypt.CompareHashAndPassword([]byte(hash), []byte(sha256Hex(password))) == nil
+	}
+	return subtle.ConstantTimeCompare([]byte(sha256Hex(password)), []byte(hash)) == 1
+}
+
+func sha256Hex(s string) string {
+	sum := sha256.Sum256([]byte(s))
 	return hex.EncodeToString(sum[:])
 }
 

@@ -112,12 +112,23 @@ func (c Config) api(method, path string, body, out any) error {
 	return nil
 }
 
-// Login exchanges the master password for a user secret.
-func Login(cfg Config, email, password string) (string, error) {
+// Login exchanges the master password for a user secret. When the server
+// confirms logins by email, code is called to ask for the code it mailed.
+func Login(cfg Config, email, password string, code func() (string, error)) (string, error) {
 	var out protocol.LoginResponse
 	err := cfg.api(http.MethodPost, protocol.LoginPath,
-		protocol.LoginRequest{Email: email, Password: password}, &out)
-	return out.Secret, err
+		protocol.LoginRequest{Email: email, Password: password, Verify: true}, &out)
+	if err != nil || out.Pending == "" {
+		return out.Secret, err
+	}
+	c, err := code()
+	if err != nil {
+		return "", err
+	}
+	var verified protocol.LoginResponse
+	err = cfg.api(http.MethodPost, protocol.LoginVerifyPath,
+		protocol.LoginVerifyRequest{Pending: out.Pending, Code: strings.TrimSpace(c)}, &verified)
+	return verified.Secret, err
 }
 
 // Logout revokes cfg.Secret server-side.
@@ -137,10 +148,20 @@ func Release(cfg Config, domain string) error {
 	return cfg.api(http.MethodPost, protocol.ReleasePath, protocol.ReleaseRequest{Domain: domain}, nil)
 }
 
-// AuthError marks a rejection of the domain/secret pair (no point retrying).
-type AuthError struct{ msg string }
+// AuthError marks a rejection that retrying cannot fix: a bad secret, a
+// domain that is invalid, reserved or owned by someone else, or a tunnel the
+// server closed for good. Status is the HTTP status of the rejection, or 0
+// when the server closed an established tunnel.
+type AuthError struct {
+	msg    string
+	Status int
+}
 
 func (e *AuthError) Error() string { return e.msg }
+
+// ErrBusy means the domain already has a live tunnel (possibly another
+// machine of the same user); it is worth retrying.
+var ErrBusy = errors.New("domain already has an active tunnel")
 
 // Run connects the control channel and serves the tunnel until the connection
 // drops (returns the cause) or auth fails (returns *AuthError). ins may be nil
@@ -200,8 +221,16 @@ func Run(cfg Config, ins *Inspector, onUp func()) error {
 		switch msg.Type {
 		case protocol.TypeOpen:
 			go serveConn(cfg, ins, msg.ID)
+		case protocol.TypePing:
+			// The server checks we are alive before letting a reconnect
+			// replace this tunnel.
+			if err := send(protocol.Message{Type: protocol.TypePong}); err != nil {
+				return fmt.Errorf("control connection lost: %w", err)
+			}
 		case protocol.TypePong:
 			// read deadline already refreshed
+		case protocol.TypeClose:
+			return &AuthError{msg: "server closed the tunnel: " + msg.Reason}
 		}
 	}
 }
@@ -227,16 +256,15 @@ func serveConn(cfg Config, ins *Inspector, id string) {
 	reqStream := io.MultiReader(bufferedBytes(br), remote) // visitor -> local
 	var respStream io.Reader = local                       // local -> visitor
 
-	// The inspector taps both directions through pipes; the relay stays a dumb
-	// byte copy and never depends on HTTP parsing succeeding.
+	// The inspector taps both directions; the relay stays a dumb byte copy
+	// and never waits on HTTP parsing (a tap's Write never blocks).
 	if ins != nil {
-		reqR, reqW := io.Pipe()
-		respR, respW := io.Pipe()
-		reqStream = io.TeeReader(reqStream, reqW)
-		respStream = io.TeeReader(respStream, respW)
-		go ins.observe(reqR, respR)
-		defer reqW.Close()
-		defer respW.Close()
+		reqTap, respTap := newTap(), newTap()
+		reqStream = io.TeeReader(reqStream, reqTap)
+		respStream = io.TeeReader(respStream, respTap)
+		go ins.observe(reqTap, respTap)
+		defer reqTap.Close()
+		defer respTap.Close()
 	}
 
 	done := make(chan struct{})
@@ -308,8 +336,11 @@ func upgrade(cfg Config, path string, extra map[string]string) (net.Conn, *bufio
 	if resp.StatusCode != http.StatusSwitchingProtocols {
 		msg := readError(resp)
 		conn.Close()
-		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusNotFound {
-			return nil, nil, &AuthError{msg: msg}
+		switch resp.StatusCode {
+		case http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound:
+			return nil, nil, &AuthError{msg: msg, Status: resp.StatusCode}
+		case http.StatusConflict:
+			return nil, nil, fmt.Errorf("%w (%s)", ErrBusy, msg)
 		}
 		return nil, nil, errors.New(msg)
 	}

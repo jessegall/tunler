@@ -41,7 +41,30 @@ func writeInfo(info tunnelInfo) error {
 func removeInfo(host, domain string) {
 	if path, err := infoPath(host, domain); err == nil {
 		os.Remove(path)
+		os.Remove(path + ".lock")
 	}
+}
+
+// holdTunnelLock takes an exclusive lock next to the tunnel's pidfile for as
+// long as the tunnel runs. A held lock proves the pidfile's process is this
+// tunnel, not an unrelated process that reused the PID after a crash. The
+// returned func releases it.
+func holdTunnelLock(host, domain string) func() {
+	path, err := infoPath(host, domain)
+	if err != nil {
+		return func() {}
+	}
+	return lockFile(path + ".lock")
+}
+
+// running reports whether the tunnel of the pidfile at path is still up. It
+// trusts the tunnel's lock when there is one and falls back to the PID for
+// pidfiles written without it.
+func running(info tunnelInfo, path string) bool {
+	if held, known := lockHeld(path + ".lock"); known {
+		return held
+	}
+	return alive(info.PID)
 }
 
 // readInfo loads a single pidfile.
@@ -154,8 +177,9 @@ func readTunnels() []tunnelInfo {
 		}
 		path := filepath.Join(dir, e.Name())
 		info, ok := readInfo(path)
-		if !ok || !alive(info.PID) {
+		if !ok || !running(info, path) {
 			os.Remove(path) // corrupt or stale
+			os.Remove(path + ".lock")
 			continue
 		}
 		out = append(out, info)

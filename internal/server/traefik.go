@@ -2,7 +2,6 @@ package server
 
 import (
 	"fmt"
-	"os"
 	"strings"
 )
 
@@ -15,6 +14,10 @@ func (s *Server) SyncTraefik() error {
 	if s.cfg.TraefikFile == "" {
 		return nil
 	}
+	// Concurrent claims must not interleave writes, nor let a rename built
+	// from an older domain list land last and drop a newer domain.
+	s.syncMu.Lock()
+	defer s.syncMu.Unlock()
 
 	rules := []string{fmt.Sprintf("HostSNI(`%s`)", s.cfg.Domain)}
 	for _, d := range s.state.Domains() {
@@ -38,9 +41,5 @@ func (s *Server) SyncTraefik() error {
 	b.WriteString("        servers:\n")
 	b.WriteString("          - address: \"tunler:443\"\n")
 
-	tmp := s.cfg.TraefikFile + ".tmp"
-	if err := os.WriteFile(tmp, []byte(b.String()), 0o644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, s.cfg.TraefikFile)
+	return writeFileAtomic(s.cfg.TraefikFile, []byte(b.String()), 0o644)
 }

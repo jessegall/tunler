@@ -116,9 +116,22 @@ the server's posture:
     "data_conn_idle_timeout": "5m"
   },
   "lockout": { "enabled": true, "threshold": 5, "max_backoff": "15m" },
-  "registration": { "mode": "allowlist", "allowlist": ["you@example.com"] }
+  "registration": { "mode": "allowlist", "allowlist": ["you@example.com"] },
+  "smtp": {                                    // confirm every login by email
+    "host": "smtp.example.com",
+    "port": 587,                               // STARTTLS; 465 = implicit TLS
+    "username": "tunler@example.com",
+    "from": "tunler@example.com"               // password: TUNLER_SMTP_PASSWORD
+  }
 }
 ```
+
+With `smtp` set, `tunler login` emails a six-digit code to the address and
+asks for it, so the master password alone can no longer log in as someone
+else. Every SMTP field can also come from the environment
+(`TUNLER_SMTP_HOST`, `TUNLER_SMTP_PORT`, `TUNLER_SMTP_USERNAME`,
+`TUNLER_SMTP_PASSWORD`, `TUNLER_SMTP_FROM`). Without SMTP the server warns at
+startup: anyone with the master password can then log in as any user.
 
 ### Without Docker
 
@@ -180,10 +193,20 @@ Env vars: `TUNLER_HOST`, `TUNLER_SECRET`, `TUNLER_PASSWORD`.
 
 - The server logs no traffic, only login and tunnel events.
 - One master password per server, required to log in. Optional allowlist to
-  restrict who can register.
+  restrict who can register. It is stored as a bcrypt hash; failed attempts,
+  at login and on gated downloads alike, share one escalating lockout.
+- With SMTP configured, each login is confirmed by a code emailed to the
+  address (10 minutes, 5 tries, 5 codes per address per hour), so users cannot
+  log in as each other. Without it, everyone with the master password is
+  trusted as every user.
 - Logins get a random 256-bit secret; the server stores only its hash.
-- Subdomains are owned by the first user to claim them.
-- Certificates are only issued for claimed subdomains.
+- Subdomains are owned by the first user to claim them. Releasing one ends
+  its live tunnel.
+- Certificates are only issued for claimed subdomains. Random names from
+  `tunler <port>` are remembered and reused, so they do not use up Let's
+  Encrypt's weekly certificate limit.
+- The local inspector only answers requests addressed to localhost, so web
+  pages cannot read captured traffic through DNS rebinding.
 - Downloads and `tunler update` trust the server over TLS; the SHA-256 is a
   corruption check, not a signature.
 
