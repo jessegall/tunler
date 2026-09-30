@@ -1,0 +1,19 @@
+# Deploys the newest published tunler image. Run by tunler-autodeploy.timer;
+# `docker compose up -d` only recreates the container when the pulled image
+# changed, so an unchanged image costs nothing.
+#
+# Install (compose project in /root/tunler):
+#   cp deploy/tunler-autodeploy.* /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now tunler-autodeploy.timer
+# Deploys show up in: journalctl -u tunler-autodeploy
+[Unit]
+Description=Deploy the newest tunler image
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/tunler
+ExecStart=/usr/bin/docker compose pull --quiet tunler
+ExecStart=/usr/bin/docker compose up -d tunler

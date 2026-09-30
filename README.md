@@ -125,6 +125,18 @@ the server's posture:
 }
 ```
 
+### Automatic updates
+
+`deploy/tunler-autodeploy.timer` pulls the newest image every five minutes
+and restarts tunler only when it changed, so every tagged release goes live
+by itself. Install it next to the compose file (paths assume `/root/tunler`):
+
+```sh
+cp deploy/tunler-autodeploy.* /etc/systemd/system/
+systemctl daemon-reload && systemctl enable --now tunler-autodeploy.timer
+journalctl -u tunler-autodeploy     # what was deployed, and when
+```
+
 ### Without Docker
 
 The same binary runs standalone. Grab `tunler-server-<os>-<arch>` from the
