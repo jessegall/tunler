@@ -59,3 +59,12 @@ func TestLoadConfigDefaultsBinDir(t *testing.T) {
 		t.Errorf("BinDir = %q, want <data>/bin", cfg.BinDir)
 	}
 }
+
+func TestCertHelloAsksForECDSA(t *testing.T) {
+	// autocert keys certificates by type; the warm-up must fetch the ECDSA
+	// one browsers use, not an RSA one nobody is served.
+	h := certHello("x.example.com")
+	if h.ServerName != "x.example.com" || len(h.SignatureSchemes) == 0 || len(h.CipherSuites) == 0 {
+		t.Fatalf("certHello = %+v", h)
+	}
+}

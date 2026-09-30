@@ -131,3 +131,39 @@ func TestReleaseClosesLiveTunnel(t *testing.T) {
 		t.Fatal("released domain still has a tunnel")
 	}
 }
+
+func TestNewClaimTriggersOnClaim(t *testing.T) {
+	srv, addr := liveServer(t)
+	claimed := make(chan string, 2)
+	srv.OnClaim = func(host string) { claimed <- host }
+	secret, _ := srv.state.AddSecret("alice")
+
+	conn, _, _ := openControl(t, addr, "fresh", secret)
+	select {
+	case host := <-claimed:
+		if host != "fresh.127.0.0.1" {
+			t.Fatalf("OnClaim(%q), want fresh.127.0.0.1", host)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("OnClaim not called for a new domain")
+	}
+	conn.Close()
+
+	// Reconnecting to an owned domain is not a new claim.
+	waitGone := time.Now().Add(2 * time.Second)
+	for time.Now().Before(waitGone) {
+		srv.mu.Lock()
+		_, up := srv.tunnels["fresh"]
+		srv.mu.Unlock()
+		if !up {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	openControl(t, addr, "fresh", secret)
+	select {
+	case host := <-claimed:
+		t.Fatalf("OnClaim(%q) on a reconnect", host)
+	case <-time.After(200 * time.Millisecond):
+	}
+}

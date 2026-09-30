@@ -155,6 +155,15 @@ func serve(cfg server.Config, run runOptions) error {
 		Email:      cfg.Email,
 		HostPolicy: srv.AllowHost,
 	}
+	// autocert fetches a certificate inside the first TLS handshake to a new
+	// subdomain, which can outlast the handshake deadline and fail that
+	// visitor. Fetching it as soon as the domain is claimed means the first
+	// visitor finds it ready.
+	srv.OnClaim = func(host string) {
+		if _, err := manager.GetCertificate(certHello(host)); err != nil {
+			log.Printf("warning: could not fetch certificate for %s: %v", host, err)
+		}
+	}
 
 	// Port 80: ACME HTTP-01 challenges, everything else redirected to HTTPS.
 	go func() {
@@ -169,6 +178,17 @@ func serve(cfg server.Config, run runOptions) error {
 	}
 	log.Printf("tunler-server on %s for %s and *.%s", run.tlsAddr, cfg.Domain, cfg.Domain)
 	return httpsServer.ListenAndServeTLS("", "")
+}
+
+// certHello is a ClientHello as a modern browser sends it, so autocert fetches
+// the same ECDSA certificate real visitors will be served.
+func certHello(host string) *tls.ClientHelloInfo {
+	return &tls.ClientHelloInfo{
+		ServerName:       host,
+		SignatureSchemes: []tls.SignatureScheme{tls.ECDSAWithP256AndSHA256},
+		SupportedCurves:  []tls.CurveID{tls.CurveP256},
+		CipherSuites:     []uint16{tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256},
+	}
 }
 
 func newHTTPServer(addr string, handler http.Handler) *http.Server {

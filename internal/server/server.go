@@ -72,6 +72,11 @@ type Server struct {
 
 	syncMu sync.Mutex // serializes SyncTraefik
 
+	// OnClaim, if set, is called in the background with the full hostname
+	// of each newly claimed domain, e.g. to fetch its TLS certificate before
+	// the first visitor arrives.
+	OnClaim func(host string)
+
 	proxy *httputil.ReverseProxy
 }
 
@@ -476,6 +481,9 @@ func (s *Server) handleControl(w http.ResponseWriter, r *http.Request) {
 	if newlyClaimed {
 		log.Printf("domain %q claimed by %s", domain, user)
 		s.syncTraefikLogged()
+		if s.OnClaim != nil {
+			go s.OnClaim(domain + "." + s.cfg.Domain)
+		}
 	}
 
 	// The domain may still hold this owner's previous control connection,
